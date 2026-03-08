@@ -1,0 +1,25 @@
+[project]
+name = "ctrade-v2"
+version = "0.1.0"
+description = "Clean cTrader bot API"
+authors = [{ name = "Francisco" }]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "pydantic",
+    "pydantic-settings",
+    "python-dotenv",
+    "pandas",
+    "numpy",
+    "ctrader-open-api",
+    "twisted"
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
