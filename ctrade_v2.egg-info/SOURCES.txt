@@ -9,8 +9,11 @@ app/broker/__init__.py
 app/broker/base.py
 app/broker/ctrader.py
 app/broker/ctrader_market_data.py
+app/db/__init__.py
+app/db/repository.py
 app/services/ctrader_client.py
 app/strategies/base.py
+app/strategies/registry.py
 app/strategies/peak_dip/detector_h4.py
 app/strategies/peak_dip/entry_m15.py
 app/strategies/peak_dip/filters.py

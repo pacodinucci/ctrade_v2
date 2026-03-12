@@ -27,6 +27,19 @@ class Settings(BaseSettings):
 
     DATABASE_URL: Optional[str] = None
 
+    ALERTS_WHATSAPP_ENABLED: bool = False
+    ALERTS_WHATSAPP_PROVIDER: str = "twilio"
+    ALERTS_WHATSAPP_TO: Optional[str] = None
+    ALERTS_WHATSAPP_FROM: Optional[str] = None
+    ALERTS_WHATSAPP_COOLDOWN_SEC: int = 120
+    ALERTS_WHATSAPP_TIMEOUT_SEC: int = 10
+
+    BOT_WHATSAPP_WEBHOOK_URL: Optional[str] = None
+    BOT_WHATSAPP_WEBHOOK_TOKEN: Optional[str] = None
+
+    TWILIO_ACCOUNT_SID: Optional[str] = None
+    TWILIO_AUTH_TOKEN: Optional[str] = None
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 

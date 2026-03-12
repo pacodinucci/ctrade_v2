@@ -1,5 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
+websockets
 httpx
 pydantic
 pydantic-settings
@@ -8,6 +9,7 @@ pandas
 numpy
 ctrader-open-api
 twisted
+psycopg[binary]
 
 [dev]
 pytest

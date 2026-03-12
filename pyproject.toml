@@ -6,7 +6,8 @@ authors = [{ name = "Francisco" }]
 requires-python = ">=3.11"
 dependencies = [
     "fastapi",
-    "uvicorn",
+    "uvicorn[standard]",
+    "websockets",
     "httpx",
     "pydantic",
     "pydantic-settings",
@@ -14,7 +15,8 @@ dependencies = [
     "pandas",
     "numpy",
     "ctrader-open-api",
-    "twisted"
+    "twisted",
+    "psycopg[binary]"
 ]
 
 [project.optional-dependencies]
@@ -23,3 +25,7 @@ dev = ["pytest", "pytest-asyncio"]
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]

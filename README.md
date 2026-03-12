@@ -52,3 +52,7 @@ uv run app/main.py  # uvicorn app.main:app --reload
 - `POST /bots/{bot_id}/start` / `.../stop`
 
 Las estrategias viven en `app/strategies`. Peak/Dip ya está modularizada; para agregar otras, seguí el patrón de `peak_dip`.
+
+
+Endpoint adicional: GET /market/price?symbol=EURUSD devuelve precio actual del instrumento.
+Endpoint adicional: GET /market/prices?symbols=EURUSD,GBPUSD devuelve precios por lote.
