@@ -106,6 +106,7 @@ class cTraderClient:
         self._poll_tasks: List[asyncio.Task] = []
         self._last_close: Dict[tuple[str, str], pd.Timestamp] = {}
         self._poll_error_log_ts: Dict[tuple[str, str, str], float] = {}
+        self._open_trade_symbol_locks: Dict[str, asyncio.Lock] = {}
 
     def _log_poll_error_throttled(self, symbol: str, timeframe: str, message: str, *, interval_sec: float) -> None:
         key = (symbol, timeframe, message[:120])
@@ -228,46 +229,74 @@ class cTraderClient:
         sl_points: int | None = None,
         tp_points: int | None = None,
     ) -> str:
-        # Open market sin SL/TP server-side. Luego se hace amend usando precio real de entrada.
-        await self.ensure_ready()
-        res = await self.broker.open_market_order(
-            symbol=symbol,
-            side=side,
-            volume=volume,
-            stop_loss=None,
-            take_profit=None,
-        )
+        symbol_u = symbol.upper().strip()
+        if not symbol_u:
+            raise RuntimeError("symbol is required")
 
-        position_id_raw = res.get("position_id")
-        if position_id_raw is None:
-            raise RuntimeError("No se obtuvo position_id al abrir la orden")
-        position_id = int(position_id_raw)
+        # Apertura atomica por simbolo para evitar doble posicion por carrera.
+        symbol_lock = self._open_trade_symbol_locks.setdefault(symbol_u, asyncio.Lock())
+        async with symbol_lock:
+            await self.ensure_ready()
+            if await md_has_open_position(symbol_u, None):
+                raise RuntimeError(
+                    f"Ya existe una posicion abierta para {symbol_u}; no se permite abrir mas de una."
+                )
 
-        final_sl = sl
-        final_tp = tp
-        if sl_points is not None and tp_points is not None:
-            entry_price = await self._resolve_entry_price(
-                symbol=symbol,
-                position_id=position_id,
-                fallback_entry=res.get("entry_price"),
-            )
-            pt = point_size(symbol.upper())
-            if side.lower() == "sell":
-                final_sl = float(entry_price) + (int(sl_points) * pt)
-                final_tp = float(entry_price) - (int(tp_points) * pt)
-            else:
-                final_sl = float(entry_price) - (int(sl_points) * pt)
-                final_tp = float(entry_price) + (int(tp_points) * pt)
-
-        if final_sl is not None or final_tp is not None:
-            await self._apply_sl_tp_with_verification(
-                symbol=symbol,
-                position_id=position_id,
-                expected_sl=final_sl,
-                expected_tp=final_tp,
+            # Open market sin SL/TP server-side. Luego se hace amend usando precio real de entrada.
+            res = await self.broker.open_market_order(
+                symbol=symbol_u,
+                side=side,
+                volume=volume,
+                stop_loss=None,
+                take_profit=None,
             )
 
-        return str(position_id)
+            position_id_raw = res.get("position_id")
+            if position_id_raw is None:
+                raise RuntimeError("No se obtuvo position_id al abrir la orden")
+            position_id = int(position_id_raw)
+            close_volume_raw = res.get("volume")
+            close_volume = float(close_volume_raw) if close_volume_raw is not None else float(volume)
+
+            final_sl = sl
+            final_tp = tp
+            if sl_points is not None and tp_points is not None:
+                entry_price = await self._resolve_entry_price(
+                    symbol=symbol_u,
+                    position_id=position_id,
+                    fallback_entry=res.get("entry_price"),
+                )
+                pt = point_size(symbol_u)
+                if side.lower() == "sell":
+                    final_sl = float(entry_price) + (int(sl_points) * pt)
+                    final_tp = float(entry_price) - (int(tp_points) * pt)
+                else:
+                    final_sl = float(entry_price) - (int(sl_points) * pt)
+                    final_tp = float(entry_price) + (int(tp_points) * pt)
+
+            if final_sl is not None or final_tp is not None:
+                try:
+                    await self._apply_sl_tp_with_verification(
+                        symbol=symbol_u,
+                        position_id=position_id,
+                        expected_sl=final_sl,
+                        expected_tp=final_tp,
+                    )
+                except Exception as exc:
+                    closed = await self._close_position_on_unprotected_open(
+                        position_id=position_id,
+                        close_volume=close_volume,
+                    )
+                    if closed:
+                        raise RuntimeError(
+                            f"SL/TP no aplicado para position_id={position_id}. "
+                            "La posicion fue cerrada automaticamente para evitar riesgo."
+                        ) from exc
+                    raise RuntimeError(
+                        f"SL/TP no aplicado para position_id={position_id} y no se pudo confirmar cierre automatico."
+                    ) from exc
+
+            return str(position_id)
 
     async def _resolve_entry_price(
         self,
@@ -310,8 +339,8 @@ class cTraderClient:
         position_id: int,
         expected_sl: float | None,
         expected_tp: float | None,
-        max_attempts: int = 8,
-        sleep_sec: float = 0.35,
+        max_attempts: int = 12,
+        sleep_sec: float = 0.45,
     ) -> None:
         tolerance = max(point_size(symbol.upper()) * 1.2, 1e-6)
 
@@ -335,6 +364,40 @@ class cTraderClient:
         raise RuntimeError(
             f"No se pudieron fijar SL/TP luego de {max_attempts} intentos (position_id={position_id})"
         )
+
+    async def _close_position_on_unprotected_open(
+        self,
+        *,
+        position_id: int,
+        close_volume: float,
+        max_attempts: int = 3,
+        wait_between_attempts_sec: float = 0.8,
+    ) -> bool:
+        for _ in range(max_attempts):
+            try:
+                await self.broker.close_position(position_id, close_volume)
+            except Exception:
+                pass
+
+            for _ in range(5):
+                await asyncio.sleep(0.4)
+                if not await self._position_exists(position_id=position_id):
+                    return True
+
+            await asyncio.sleep(wait_between_attempts_sec)
+
+        return not await self._position_exists(position_id=position_id)
+
+    async def _position_exists(self, *, position_id: int) -> bool:
+        try:
+            positions = await get_open_positions()
+        except Exception:
+            return True
+
+        for p in positions:
+            if int(p.get("position_id") or 0) == int(position_id):
+                return True
+        return False
 
     async def _is_sl_tp_applied(
         self,
@@ -378,3 +441,4 @@ class cTraderClient:
     async def has_open_position(self, symbol: str, side: str | None = None) -> bool:
         await self.ensure_ready()
         return await md_has_open_position(symbol, side)
+

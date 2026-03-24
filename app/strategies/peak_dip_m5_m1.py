@@ -84,7 +84,12 @@ class PeakDipM5M1Strategy:
             if now > window["deadline"]:
                 continue
 
-            entry = evaluate_entry(list(self.m1_buffer), side=window["side"], symbol=self.symbol)
+            entry = evaluate_entry(
+                list(self.m1_buffer),
+                side=window["side"],
+                symbol=self.symbol,
+                setup_time=window["setup_time"],
+            )
             if not entry:
                 active.append(window)
                 continue
