@@ -339,7 +339,7 @@ class cTraderClient:
         position_id: int,
         expected_sl: float | None,
         expected_tp: float | None,
-        max_attempts: int = 12,
+        max_attempts: int = 10,
         sleep_sec: float = 0.45,
     ) -> None:
         tolerance = max(point_size(symbol.upper()) * 1.2, 1e-6)

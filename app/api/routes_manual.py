@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -8,9 +9,13 @@ from pydantic import BaseModel, Field
 from app.broker import get_broker
 from app.broker.base import Side
 from app.broker.ctrader_market_data import (
+    close_position as md_close_position,
+    get_open_positions as md_get_open_positions,
+    has_open_position as md_has_open_position,
     open_market_order as md_open_market_order,
     set_position_sl_tp as md_set_position_sl_tp,
 )
+from app.strategies.peak_dip.utils import point_size
 
 router = APIRouter(prefix="/manual", tags=["manual"])
 
@@ -38,14 +43,79 @@ class ManualCloseOrderRequest(BaseModel):
     )
 
 
+async def _apply_manual_sl_tp_with_verification(
+    *,
+    position_id: int,
+    expected_sl: float | None,
+    expected_tp: float | None,
+    symbol: str,
+    max_attempts: int = 10,
+    sleep_sec: float = 0.35,
+) -> tuple[bool, dict | None, str | None]:
+    tolerance = max(point_size(symbol.upper()) * 1.2, 1e-6)
+    last_result: dict | None = None
+    last_error: str | None = None
+
+    for _ in range(max_attempts):
+        try:
+            last_result = await md_set_position_sl_tp(
+                symbol=symbol,
+                position_id=int(position_id),
+                stop_loss=expected_sl,
+                take_profit=expected_tp,
+            )
+        except Exception as exc:
+            last_error = repr(exc)
+
+        positions = await md_get_open_positions()
+        target = None
+        for p in positions:
+            if int(p.get("position_id") or 0) == int(position_id):
+                target = p
+                break
+
+        if target is not None:
+            actual_sl = target.get("stop_loss")
+            actual_tp = target.get("take_profit")
+            sl_ok = (
+                expected_sl is None
+                or (actual_sl is not None and abs(float(actual_sl) - float(expected_sl)) <= tolerance)
+            )
+            tp_ok = (
+                expected_tp is None
+                or (actual_tp is not None and abs(float(actual_tp) - float(expected_tp)) <= tolerance)
+            )
+            if bool(sl_ok and tp_ok):
+                return True, last_result, last_error
+
+        await asyncio.sleep(sleep_sec)
+
+    return False, last_result, last_error
+
+
+async def _is_position_closed(position_id: int) -> bool:
+    positions = await md_get_open_positions()
+    for p in positions:
+        if int(p.get("position_id") or 0) == int(position_id):
+            return False
+    return True
+
+
 @router.post("/open")
 async def manual_open_order(body: ManualOpenOrderRequest):
     """
     Abre una orden de mercado manual y, si es posible, setea SL/TP inmediatamente.
     """
+    symbol_u = body.symbol.strip().upper()
+    if await md_has_open_position(symbol_u, None):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ya existe una posicion abierta para {symbol_u}. No se permite mas de una por instrumento.",
+        )
+
     try:
         opened = await md_open_market_order(
-            symbol=body.symbol,
+            symbol=symbol_u,
             side=body.side,
             volume=body.volume,
         )
@@ -63,7 +133,7 @@ async def manual_open_order(body: ManualOpenOrderRequest):
         return {
             "status": "partial",
             "detail": "Orden enviada, pero no se pudo confirmar position_id/entry_price. No se aplico SL/TP.",
-            "symbol": body.symbol,
+            "symbol": symbol_u,
             "side": body.side,
             "volume": body.volume,
             "opened": opened,
@@ -81,25 +151,43 @@ async def manual_open_order(body: ManualOpenOrderRequest):
             sl = entry_price + 2.0
             tp = entry_price - 1.0
 
-    try:
-        sl_tp_result = await md_set_position_sl_tp(
-            symbol=body.symbol,
-            position_id=int(position_id),
-            stop_loss=sl,
-            take_profit=tp,
-        )
-    except Exception as exc:
+    sl_tp_ok, sl_tp_result, sl_tp_last_error = await _apply_manual_sl_tp_with_verification(
+        position_id=int(position_id),
+        expected_sl=sl,
+        expected_tp=tp,
+        symbol=symbol_u,
+    )
+    if not sl_tp_ok:
+        close_volume_raw = opened.get("volume")
+        close_volume = float(close_volume_raw) if close_volume_raw is not None else float(body.volume)
+        try:
+            await md_close_position(position_id=int(position_id), volume=close_volume)
+        except Exception:
+            pass
+
+        for _ in range(8):
+            await asyncio.sleep(0.35)
+            if await _is_position_closed(int(position_id)):
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Operacion abierta (position_id={position_id}) sin SL/TP confirmado; "
+                        "se cerro automaticamente para evitar riesgo."
+                    ),
+                )
+
         raise HTTPException(
             status_code=500,
             detail=(
-                f"Operacion abierta (position_id={position_id}), "
-                f"pero error al setear SL/TP: {exc!r}"
+                f"Operacion abierta (position_id={position_id}) sin SL/TP confirmado; "
+                "no se pudo confirmar cierre automatico. "
+                f"Ultimo error de seteo: {sl_tp_last_error or 'N/A'}"
             ),
-        ) from exc
+        )
 
     return {
         "status": "ok",
-        "symbol": body.symbol,
+        "symbol": symbol_u,
         "side": body.side,
         "volume": body.volume,
         "opened": opened,
