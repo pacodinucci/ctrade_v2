@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 from app.broker import get_broker
 from app.broker.base import Side
 from app.broker.ctrader_market_data import (
-    close_position as md_close_position,
     get_open_positions as md_get_open_positions,
     has_open_position as md_has_open_position,
     open_market_order as md_open_market_order,
@@ -49,14 +48,13 @@ async def _apply_manual_sl_tp_with_verification(
     expected_sl: float | None,
     expected_tp: float | None,
     symbol: str,
-    max_attempts: int = 10,
     sleep_sec: float = 0.35,
-) -> tuple[bool, dict | None, str | None]:
+) -> tuple[dict | None, str | None]:
     tolerance = max(point_size(symbol.upper()) * 1.2, 1e-6)
     last_result: dict | None = None
     last_error: str | None = None
 
-    for _ in range(max_attempts):
+    while True:
         try:
             last_result = await md_set_position_sl_tp(
                 symbol=symbol,
@@ -77,6 +75,7 @@ async def _apply_manual_sl_tp_with_verification(
         if target is not None:
             actual_sl = target.get("stop_loss")
             actual_tp = target.get("take_profit")
+            stops_ok = bool(target.get("stops"))
             sl_ok = (
                 expected_sl is None
                 or (actual_sl is not None and abs(float(actual_sl) - float(expected_sl)) <= tolerance)
@@ -85,20 +84,41 @@ async def _apply_manual_sl_tp_with_verification(
                 expected_tp is None
                 or (actual_tp is not None and abs(float(actual_tp) - float(expected_tp)) <= tolerance)
             )
-            if bool(sl_ok and tp_ok):
-                return True, last_result, last_error
+            if bool(stops_ok and sl_ok and tp_ok):
+                return last_result, last_error
 
         await asyncio.sleep(sleep_sec)
 
-    return False, last_result, last_error
 
+async def _resolve_position_from_reconcile(
+    *,
+    symbol: str,
+    side: Side,
+    max_attempts: int = 10,
+    sleep_sec: float = 0.35,
+) -> tuple[int, float | None, float | None] | None:
+    desired_trade_side = 1 if str(side).lower() == "buy" else 2
 
-async def _is_position_closed(position_id: int) -> bool:
-    positions = await md_get_open_positions()
-    for p in positions:
-        if int(p.get("position_id") or 0) == int(position_id):
-            return False
-    return True
+    for _ in range(max_attempts):
+        positions = await md_get_open_positions()
+        candidates = [
+            p
+            for p in positions
+            if str(p.get("symbol") or "").upper() == symbol
+            and int(p.get("trade_side") or 0) == desired_trade_side
+            and p.get("position_id") is not None
+        ]
+        if candidates:
+            candidates.sort(key=lambda p: int(p.get("open_timestamp") or 0), reverse=True)
+            best = candidates[0]
+            return (
+                int(best.get("position_id")),
+                float(best.get("open_price")) if best.get("open_price") is not None else None,
+                float(best.get("volume")) if best.get("volume") is not None else None,
+            )
+        await asyncio.sleep(sleep_sec)
+
+    return None
 
 
 @router.post("/open")
@@ -128,22 +148,38 @@ async def manual_open_order(body: ManualOpenOrderRequest):
     position_id = opened.get("position_id")
     entry_price = opened.get("entry_price")
 
-    # Si no se pudo confirmar entrada, devolvemos el estado parcial.
+    # Si no se pudo confirmar entrada, intentamos reconciliar por posiciones abiertas.
     if position_id is None or entry_price is None:
-        return {
-            "status": "partial",
-            "detail": "Orden enviada, pero no se pudo confirmar position_id/entry_price. No se aplico SL/TP.",
-            "symbol": symbol_u,
-            "side": body.side,
-            "volume": body.volume,
-            "opened": opened,
-        }
+        resolved = await _resolve_position_from_reconcile(symbol=symbol_u, side=body.side)
+        if resolved is None:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Orden enviada, pero no se pudo identificar position_id/entry_price via reconcile. "
+                    "No es posible confirmar SL/TP en esta operacion."
+                ),
+            )
+        position_id, resolved_entry_price, resolved_volume = resolved
+        opened["position_id"] = int(position_id)
+        if resolved_entry_price is not None:
+            opened["entry_price"] = float(resolved_entry_price)
+            entry_price = float(resolved_entry_price)
+        if resolved_volume is not None:
+            opened["volume"] = float(resolved_volume)
 
     sl = body.stop_loss
     tp = body.take_profit
 
     # Defaults de prueba si no vienen en el payload.
     if sl is None and tp is None:
+        if entry_price is None:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Operacion abierta (position_id={position_id}), pero sin entry_price confirmado. "
+                    "No se pueden calcular SL/TP por defecto."
+                ),
+            )
         if body.side == "buy":
             sl = entry_price - 2.0
             tp = entry_price + 1.0
@@ -151,39 +187,12 @@ async def manual_open_order(body: ManualOpenOrderRequest):
             sl = entry_price + 2.0
             tp = entry_price - 1.0
 
-    sl_tp_ok, sl_tp_result, sl_tp_last_error = await _apply_manual_sl_tp_with_verification(
+    sl_tp_result, sl_tp_last_error = await _apply_manual_sl_tp_with_verification(
         position_id=int(position_id),
         expected_sl=sl,
         expected_tp=tp,
         symbol=symbol_u,
     )
-    if not sl_tp_ok:
-        close_volume_raw = opened.get("volume")
-        close_volume = float(close_volume_raw) if close_volume_raw is not None else float(body.volume)
-        try:
-            await md_close_position(position_id=int(position_id), volume=close_volume)
-        except Exception:
-            pass
-
-        for _ in range(8):
-            await asyncio.sleep(0.35)
-            if await _is_position_closed(int(position_id)):
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        f"Operacion abierta (position_id={position_id}) sin SL/TP confirmado; "
-                        "se cerro automaticamente para evitar riesgo."
-                    ),
-                )
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Operacion abierta (position_id={position_id}) sin SL/TP confirmado; "
-                "no se pudo confirmar cierre automatico. "
-                f"Ultimo error de seteo: {sl_tp_last_error or 'N/A'}"
-            ),
-        )
 
     return {
         "status": "ok",
@@ -192,6 +201,7 @@ async def manual_open_order(body: ManualOpenOrderRequest):
         "volume": body.volume,
         "opened": opened,
         "sl_tp": sl_tp_result,
+        "sl_tp_last_error": sl_tp_last_error,
     }
 
 

@@ -339,31 +339,33 @@ class cTraderClient:
         position_id: int,
         expected_sl: float | None,
         expected_tp: float | None,
-        max_attempts: int = 10,
         sleep_sec: float = 0.45,
     ) -> None:
         tolerance = max(point_size(symbol.upper()) * 1.2, 1e-6)
 
-        for _ in range(max_attempts):
-            await set_position_sl_tp(
-                symbol=symbol,
-                position_id=position_id,
-                stop_loss=expected_sl,
-                take_profit=expected_tp,
-            )
+        while True:
+            try:
+                await set_position_sl_tp(
+                    symbol=symbol,
+                    position_id=position_id,
+                    stop_loss=expected_sl,
+                    take_profit=expected_tp,
+                )
+            except Exception:
+                pass
+
+            try:
+                if await self._is_sl_tp_applied(
+                    position_id=position_id,
+                    expected_sl=expected_sl,
+                    expected_tp=expected_tp,
+                    tolerance=tolerance,
+                ):
+                    return
+            except Exception:
+                pass
+
             await asyncio.sleep(sleep_sec)
-
-            if await self._is_sl_tp_applied(
-                position_id=position_id,
-                expected_sl=expected_sl,
-                expected_tp=expected_tp,
-                tolerance=tolerance,
-            ):
-                return
-
-        raise RuntimeError(
-            f"No se pudieron fijar SL/TP luego de {max_attempts} intentos (position_id={position_id})"
-        )
 
     async def _close_position_on_unprotected_open(
         self,
@@ -419,6 +421,7 @@ class cTraderClient:
 
         actual_sl = target.get("stop_loss")
         actual_tp = target.get("take_profit")
+        stops_ok = bool(target.get("stops"))
 
         sl_ok = (
             expected_sl is None
@@ -428,7 +431,7 @@ class cTraderClient:
             expected_tp is None
             or (actual_tp is not None and abs(float(actual_tp) - float(expected_tp)) <= tolerance)
         )
-        return bool(sl_ok and tp_ok)
+        return bool(stops_ok and sl_ok and tp_ok)
 
     async def close_trade(self, position_id: int) -> None:
         await self.ensure_ready()

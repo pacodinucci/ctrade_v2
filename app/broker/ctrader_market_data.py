@@ -793,6 +793,7 @@ class CTraderMarketDataService:
                             "open_price": float(open_price) if open_price is not None else None,
                             "stop_loss": float(stop_loss) if stop_loss is not None else None,
                             "take_profit": float(take_profit) if take_profit is not None else None,
+                            "stops": bool(stop_loss is not None and take_profit is not None),
                             "open_timestamp": int(open_timestamp) if open_timestamp is not None else None,
                         }
                     )
