@@ -527,3 +527,44 @@ Notas:
 - Se notifican errores HTTP 5xx y excepciones no controladas en requests.
 - Hay cooldown por ruta/metodo/status para evitar spam.
 - Para validar configuracion: `POST /alerts/test-whatsapp`.
+
+## 13. Historico de velas (`/history`)
+Endpoint:
+- `GET /history/{instrument}/{timeframe}`
+
+Timeframes canonicos:
+- `M1`, `M5`, `M15`, `H1`, `H4`
+
+Aliases aceptados (normaliza a canonico):
+- `m1`, `1m`, `MINUTE_1`
+- `m5`, `5m`, `MINUTE_5`
+- `m15`, `15m`, `MINUTE_15`
+- `1h`, `HOUR_1`
+- `4h`, `HOUR_4`
+
+Query params canonicos:
+- `start`: ISO datetime o `YYYY-MM-DD`
+- `end`: ISO datetime o `YYYY-MM-DD`
+- `limit`: entero entre `1` y `2500` (default `500`)
+
+Shape de respuesta (siempre estable):
+```json
+{
+  "instrument": "USDCHF",
+  "timeframe": "M5",
+  "count": 1234,
+  "candles": [
+    {
+      "time": "2026-03-31T16:15:00Z",
+      "open": 0.80231,
+      "high": 0.80256,
+      "low": 0.80227,
+      "close": 0.80249
+    }
+  ]
+}
+```
+
+Semantica de errores:
+- `400`: instrumento/timeframe/query invalidos.
+- `502`: error consultando datasource de mercado.

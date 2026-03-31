@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 
+from app.api.history_contract import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    normalize_timeframe,
+    parse_datetime_param,
+    parse_limit,
+    serialize_history_payload,
+)
 from app.bots.manager import BotManager
 from app.services.ctrader_client import cTraderClient
 from app.services.market_data_hub import MarketDataHub, get_market_data_hub
@@ -401,6 +410,93 @@ async def get_market_hub_symbol_state(
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
     return await hub.get_symbol_state(symbol)
+
+
+@router.get("/history/{instrument}/{timeframe}")
+async def get_history(
+    instrument: str,
+    timeframe: str,
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    limit: int = Query(default=DEFAULT_LIMIT),
+):
+    instrument_u = instrument.strip().upper()
+    if not instrument_u:
+        raise HTTPException(status_code=400, detail="instrument is required")
+
+    try:
+        normalized_tf = normalize_timeframe(timeframe)
+        normalized_limit = parse_limit(limit)
+        start_dt = (
+            parse_datetime_param("start", start, end_of_day_if_date=False)
+            if start is not None
+            else None
+        )
+        end_dt = (
+            parse_datetime_param("end", end, end_of_day_if_date=True)
+            if end is not None
+            else None
+        )
+        if start_dt is not None and end_dt is not None and start_dt > end_dt:
+            raise ValueError("start must be before or equal to end")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    fetch_count = MAX_LIMIT if (start_dt is not None or end_dt is not None) else normalized_limit
+
+    from app.broker.ctrader_market_data import get_trendbars
+
+    try:
+        df = await get_trendbars(instrument_u, normalized_tf, count=fetch_count)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "Simbolo" in message or "Timeframe no soportado" in message:
+            raise HTTPException(status_code=400, detail=message) from exc
+        raise HTTPException(status_code=502, detail=f"Could not fetch history: {message}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch history: {exc}") from exc
+
+    candles: list[dict[str, Any]] = []
+    for row in df.itertuples(index=False):
+        candle_time = getattr(row, "time", None)
+        if candle_time is None:
+            continue
+
+        if hasattr(candle_time, "to_pydatetime"):
+            candle_dt = candle_time.to_pydatetime()
+        elif isinstance(candle_time, datetime):
+            candle_dt = candle_time
+        else:
+            continue
+
+        if candle_dt.tzinfo is None:
+            candle_dt = candle_dt.replace(tzinfo=timezone.utc)
+        else:
+            candle_dt = candle_dt.astimezone(timezone.utc)
+
+        if start_dt is not None and candle_dt < start_dt:
+            continue
+        if end_dt is not None and candle_dt > end_dt:
+            continue
+
+        candles.append(
+            {
+                "time": candle_dt.isoformat().replace("+00:00", "Z"),
+                "open": float(getattr(row, "open")),
+                "high": float(getattr(row, "high")),
+                "low": float(getattr(row, "low")),
+                "close": float(getattr(row, "close")),
+            }
+        )
+
+    if len(candles) > normalized_limit:
+        candles = candles[-normalized_limit:]
+
+    return serialize_history_payload(
+        instrument=instrument_u,
+        timeframe=normalized_tf,
+        candles=candles,
+    )
 
 
 

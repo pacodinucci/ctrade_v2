@@ -5,6 +5,8 @@ from typing import Any, Callable
 
 from app.services.ctrader_client import cTraderClient
 from app.strategies.fast_test.strategy import FastTestStrategy
+from app.strategies.leg_continuation.strategy_m5_m1 import LegContinuationM5M1Strategy
+from app.strategies.leg_continuation.strategy import LegContinuationH4M15Strategy
 from app.strategies.peak_dip.strategy import PeakDipStrategy
 from app.strategies.peak_dip_m5_m1 import PeakDipM5M1Strategy
 from app.strategies.peak_dip.trade_manager import TradeManager
@@ -123,6 +125,86 @@ def _normalize_fast_test_params(strategy_params: dict[str, Any] | None) -> dict[
     }
 
 
+def _normalize_leg_continuation_params(strategy_params: dict[str, Any] | None) -> dict[str, Any]:
+    params = strategy_params or {}
+    if not isinstance(params, dict):
+        raise ValueError("strategyParams debe ser un objeto JSON")
+
+    if params.get("volume") is None:
+        raise ValueError("volume es requerido")
+    volume = float(params.get("volume"))
+    sl_points = int(params.get("sl_points", 100))
+    tp_points = int(params.get("tp_points", 200))
+    pivot_strength = int(params.get("pivot_strength", 2))
+    leg_mode = str(params.get("leg_mode", "extended")).strip().lower()
+
+    if volume < 100000:
+        raise ValueError("volume debe ser >= 100000")
+    if sl_points <= 0 or tp_points <= 0:
+        raise ValueError("sl_points y tp_points deben ser mayores a 0")
+    if pivot_strength < 1:
+        raise ValueError("pivot_strength debe ser >= 1")
+    if leg_mode != "extended":
+        raise ValueError("leg_mode debe ser 'extended'")
+
+    return {
+        "volume": volume,
+        "sl_points": sl_points,
+        "tp_points": tp_points,
+        "pivot_strength": pivot_strength,
+        "leg_mode": leg_mode,
+    }
+
+
+def _create_leg_continuation_runtime(
+    symbol: str,
+    client: cTraderClient,
+    params: dict[str, Any],
+) -> LegContinuationH4M15Strategy:
+    return LegContinuationH4M15Strategy(
+        symbol=symbol,
+        client=client,
+        volume=float(params["volume"]),
+        sl_points=int(params["sl_points"]),
+        tp_points=int(params["tp_points"]),
+        pivot_strength=int(params["pivot_strength"]),
+        leg_mode=str(params["leg_mode"]),
+    )
+
+
+def _create_leg_continuation_m5_m1_runtime(
+    symbol: str,
+    client: cTraderClient,
+    params: dict[str, Any],
+) -> LegContinuationM5M1Strategy:
+    return LegContinuationM5M1Strategy(
+        symbol=symbol,
+        client=client,
+        volume=float(params["volume"]),
+        sl_points=int(params["sl_points"]),
+        tp_points=int(params["tp_points"]),
+        pivot_strength=int(params["pivot_strength"]),
+        leg_mode=str(params["leg_mode"]),
+    )
+
+
+def _build_leg_continuation_plan(symbol: str, params: dict[str, Any], side: str, entry: float) -> dict[str, Any]:
+    pt = point_size(symbol)
+    sl_points = int(params["sl_points"])
+    tp_points = int(params["tp_points"])
+    side_u = str(side).strip().lower()
+
+    if side_u == "sell":
+        sl = entry + (sl_points * pt)
+        tp = entry - (tp_points * pt)
+    else:
+        side_u = "buy"
+        sl = entry - (sl_points * pt)
+        tp = entry + (tp_points * pt)
+
+    return {"side": side_u, "entry": entry, "sl": sl, "tp": tp}
+
+
 def _create_fast_test_runtime(symbol: str, client: cTraderClient, params: dict[str, Any]) -> FastTestStrategy:
     return FastTestStrategy(
         symbol=symbol,
@@ -194,6 +276,34 @@ _REGISTRY: dict[str, StrategyDefinition] = {
         normalize_params=_normalize_fast_test_params,
         create_runtime=_create_fast_test_runtime,
         build_plan=_build_fast_test_plan,
+    ),
+    "leg_continuation_h4_m15": StrategyDefinition(
+        id="leg_continuation_h4_m15",
+        name="Leg Continuation H4/M15",
+        params=(
+            StrategyParamDef(key="volume", type="float", required=True, default=100000),
+            StrategyParamDef(key="sl_points", type="int", required=True, default=100),
+            StrategyParamDef(key="tp_points", type="int", required=True, default=200),
+            StrategyParamDef(key="pivot_strength", type="int", required=True, default=2),
+            StrategyParamDef(key="leg_mode", type="string", required=True, default="extended"),
+        ),
+        normalize_params=_normalize_leg_continuation_params,
+        create_runtime=_create_leg_continuation_runtime,
+        build_plan=_build_leg_continuation_plan,
+    ),
+    "leg_continuation_m5_m1": StrategyDefinition(
+        id="leg_continuation_m5_m1",
+        name="Leg Continuation M5/M1",
+        params=(
+            StrategyParamDef(key="volume", type="float", required=True, default=100000),
+            StrategyParamDef(key="sl_points", type="int", required=True, default=100),
+            StrategyParamDef(key="tp_points", type="int", required=True, default=200),
+            StrategyParamDef(key="pivot_strength", type="int", required=True, default=2),
+            StrategyParamDef(key="leg_mode", type="string", required=True, default="extended"),
+        ),
+        normalize_params=_normalize_leg_continuation_params,
+        create_runtime=_create_leg_continuation_m5_m1_runtime,
+        build_plan=_build_leg_continuation_plan,
     ),
 }
 
