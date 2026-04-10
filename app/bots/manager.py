@@ -153,6 +153,7 @@ class BotManager:
             if previous_runtime is not None:
                 await self._stop_runtime(bot_id, previous_runtime)
             self.bots[bot_id] = self._build_strategy(next_strategy, next_symbol, normalized_params)
+            self._attach_runtime_metadata(self.bots[bot_id], bot_id=bot_id, strategy=next_strategy)
             await self._ensure_runtime_market_subscription(self.bots[bot_id])
             await self._start_runtime(bot_id, self.bots[bot_id])
         await self._release_unused_symbol_spot_streams()
@@ -196,6 +197,7 @@ class BotManager:
         normalized_params = self._validate_and_normalize_params(strategy, params)
 
         self.bots[bot_id] = self._build_strategy(strategy, symbol, normalized_params)
+        self._attach_runtime_metadata(self.bots[bot_id], bot_id=bot_id, strategy=strategy)
         await self._ensure_runtime_market_subscription(self.bots[bot_id])
         await self._start_runtime(bot_id, self.bots[bot_id])
         await self._release_unused_symbol_spot_streams()
@@ -251,6 +253,23 @@ class BotManager:
 
     async def list_strategies(self) -> list[dict[str, Any]]:
         return list_strategies_metadata()
+
+    async def list_trade_registry(
+        self,
+        *,
+        limit: int = 200,
+        bot_id: str | None = None,
+        symbol: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.repository is None:
+            return []
+        return await self.repository.list_trades(
+            limit=limit,
+            bot_id=bot_id,
+            symbol=symbol,
+            status=status,
+        )
 
 
     async def start_active_bots_market_stream(self) -> dict[str, Any]:
@@ -331,6 +350,7 @@ class BotManager:
                 params = row.get("params") if isinstance(row.get("params"), dict) else {}
                 normalized_params = self._validate_and_normalize_params(strategy, params)
                 self.bots[bot_id] = self._build_strategy(strategy, symbol, normalized_params)
+                self._attach_runtime_metadata(self.bots[bot_id], bot_id=bot_id, strategy=strategy)
                 await self._ensure_runtime_market_subscription(self.bots[bot_id])
                 await self._start_runtime(bot_id, self.bots[bot_id])
                 await self._release_unused_symbol_spot_streams()
@@ -436,6 +456,11 @@ class BotManager:
     ) -> Strategy:
         definition = get_strategy_definition(strategy)
         return definition.create_runtime(symbol, self.client, params)
+
+    @staticmethod
+    def _attach_runtime_metadata(runtime: Strategy, *, bot_id: str, strategy: str) -> None:
+        setattr(runtime, "bot_id", bot_id)
+        setattr(runtime, "strategy_id", strategy)
 
     async def _start_runtime(self, bot_id: str, runtime: Strategy) -> None:
         await self._start_bot_consumers(bot_id, runtime)

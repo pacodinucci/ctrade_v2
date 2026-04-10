@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Dict, List
 import pandas as pd
 
 from app.broker.ctrader import CTraderBroker
+from app.db.repository import BotRepository, TradeCreateInput
 from app.broker.ctrader_market_data import (
     get_connection_status,
     get_current_price,
@@ -15,6 +16,12 @@ from app.broker.ctrader_market_data import (
     has_open_position as md_has_open_position,
     set_position_sl_tp,
     wait_until_ready,
+)
+from app.services.sltp import (
+    CTraderOrderError,
+    compute_sl_tp_from_points,
+    normalize_points,
+    validate_sl_tp_for_side,
 )
 from app.strategies.peak_dip.utils import point_size
 from app.utils.time import ensure_utc_timestamp
@@ -97,8 +104,9 @@ def _seconds_until_next_close(timeframe: str, *, delay_sec: float = 2.0) -> floa
 class cTraderClient:
     """Facade sobre el broker + market data real de cTrader."""
 
-    def __init__(self) -> None:
+    def __init__(self, repository: BotRepository | None = None) -> None:
         self.broker = CTraderBroker()
+        self.repository = repository
         self._h4_handlers: Dict[str, List[CandleHandler]] = {}
         self._m15_handlers: Dict[str, List[CandleHandler]] = {}
         self._m5_handlers: Dict[str, List[CandleHandler]] = {}
@@ -224,6 +232,9 @@ class cTraderClient:
         symbol: str,
         side: str,
         volume: float,
+        bot_id: str | None = None,
+        strategy: str | None = None,
+        source: str = "bot",
         sl: float | None = None,
         tp: float | None = None,
         sl_points: int | None = None,
@@ -260,27 +271,58 @@ class cTraderClient:
 
             final_sl = sl
             final_tp = tp
+            resolved_side = side.lower().strip()
+            entry_price_for_validation: float | None = None
+            sl_points_abs: float | None = None
+            tp_points_abs: float | None = None
             if sl_points is not None and tp_points is not None:
                 entry_price = await self._resolve_entry_price(
                     symbol=symbol_u,
                     position_id=position_id,
                     fallback_entry=res.get("entry_price"),
                 )
+                entry_price_for_validation = float(entry_price)
                 pt = point_size(symbol_u)
-                if side.lower() == "sell":
-                    final_sl = float(entry_price) + (int(sl_points) * pt)
-                    final_tp = float(entry_price) - (int(tp_points) * pt)
-                else:
-                    final_sl = float(entry_price) - (int(sl_points) * pt)
-                    final_tp = float(entry_price) + (int(tp_points) * pt)
+                sl_points_abs = normalize_points(sl_points)
+                tp_points_abs = normalize_points(tp_points)
+                if sl_points_abs is None or tp_points_abs is None:
+                    raise RuntimeError("sl_points/tp_points no pueden ser nulos")
+                final_sl, final_tp = compute_sl_tp_from_points(
+                    side=resolved_side,
+                    entry_price=entry_price_for_validation,
+                    pip_size=pt,
+                    sl_points=sl_points_abs,
+                    tp_points=tp_points_abs,
+                )
+
+            if (final_sl is not None or final_tp is not None) and entry_price_for_validation is None:
+                entry_price_for_validation = float(
+                    await self._resolve_entry_price(
+                        symbol=symbol_u,
+                        position_id=position_id,
+                        fallback_entry=res.get("entry_price"),
+                    )
+                )
 
             if final_sl is not None or final_tp is not None:
                 try:
+                    validate_sl_tp_for_side(
+                        side=resolved_side,
+                        entry_price=float(entry_price_for_validation),
+                        stop_loss=final_sl,
+                        take_profit=final_tp,
+                        min_distance=max(point_size(symbol_u), 1e-6),
+                    )
                     await self._apply_sl_tp_with_verification(
                         symbol=symbol_u,
                         position_id=position_id,
+                        side=resolved_side,
+                        entry_price=float(entry_price_for_validation),
                         expected_sl=final_sl,
                         expected_tp=final_tp,
+                        pip_size=point_size(symbol_u),
+                        sl_points=sl_points_abs,
+                        tp_points=tp_points_abs,
                     )
                 except Exception as exc:
                     closed = await self._close_position_on_unprotected_open(
@@ -296,7 +338,32 @@ class cTraderClient:
                         f"SL/TP no aplicado para position_id={position_id} y no se pudo confirmar cierre automatico."
                     ) from exc
 
-            return str(position_id)
+            position_id_str = str(position_id)
+            if self.repository is not None:
+                try:
+                    await self.repository.create_trade(
+                        TradeCreateInput(
+                            position_id=position_id_str,
+                            bot_id=bot_id,
+                            source=source,
+                            strategy=strategy,
+                            symbol=symbol_u,
+                            side=side.lower().strip(),
+                            volume=float(close_volume),
+                            open_price=float(await self._resolve_entry_price(
+                                symbol=symbol_u,
+                                position_id=position_id,
+                                fallback_entry=res.get("entry_price"),
+                            )),
+                            stop_loss=final_sl,
+                            take_profit=final_tp,
+                            metadata={"sl_points": sl_points, "tp_points": tp_points},
+                        )
+                    )
+                except Exception as exc:
+                    print(f"[cTraderClient] trade log create failed for {position_id_str}: {exc!r}")
+
+            return position_id_str
 
     async def _resolve_entry_price(
         self,
@@ -337,13 +404,20 @@ class cTraderClient:
         *,
         symbol: str,
         position_id: int,
+        side: str,
+        entry_price: float,
         expected_sl: float | None,
         expected_tp: float | None,
         sleep_sec: float = 0.45,
+        max_retries: int = 2,
+        pip_size: float | None = None,
+        sl_points: float | None = None,
+        tp_points: float | None = None,
     ) -> None:
         tolerance = max(point_size(symbol.upper()) * 1.2, 1e-6)
-
-        while True:
+        last_error: Exception | None = None
+        attempts = max_retries + 1
+        for attempt in range(attempts):
             try:
                 await set_position_sl_tp(
                     symbol=symbol,
@@ -351,8 +425,19 @@ class cTraderClient:
                     stop_loss=expected_sl,
                     take_profit=expected_tp,
                 )
-            except Exception:
-                pass
+            except CTraderOrderError as exc:
+                last_error = exc
+                if not exc.retryable:
+                    print(
+                        "[cTraderClient] AMEND terminal error -> "
+                        f"positionId={position_id}, symbol={symbol}, side={side}, "
+                        f"entry={entry_price}, pip_size={pip_size}, sl_points={sl_points}, tp_points={tp_points}, "
+                        f"sl_price={expected_sl}, tp_price={expected_tp}, raw_request={exc.raw_request}, "
+                        f"error={exc.error_code}:{exc.description}"
+                    )
+                    raise
+            except Exception as exc:
+                last_error = exc
 
             try:
                 if await self._is_sl_tp_applied(
@@ -365,7 +450,14 @@ class cTraderClient:
             except Exception:
                 pass
 
-            await asyncio.sleep(sleep_sec)
+            if attempt < (attempts - 1):
+                await asyncio.sleep(sleep_sec * (2**attempt))
+
+        raise RuntimeError(
+            "No se pudo confirmar SL/TP luego de reintentos controlados "
+            f"(positionId={position_id}, symbol={symbol}, sl={expected_sl}, tp={expected_tp}, "
+            f"last_error={last_error!r})"
+        )
 
     async def _close_position_on_unprotected_open(
         self,
@@ -433,9 +525,43 @@ class cTraderClient:
         )
         return bool(stops_ok and sl_ok and tp_ok)
 
-    async def close_trade(self, position_id: int) -> None:
+    async def close_trade(
+        self,
+        position_id: int,
+        *,
+        close_reason: str = "MANUAL_CLOSE",
+        source: str = "bot",
+    ) -> None:
+        close_price: float | None = None
+        symbol_for_price: str | None = None
+        try:
+            positions = await get_open_positions()
+            for item in positions:
+                if int(item.get("position_id") or 0) == int(position_id):
+                    symbol_for_price = str(item.get("symbol") or "").upper() or None
+                    break
+        except Exception:
+            symbol_for_price = None
+
+        if symbol_for_price:
+            try:
+                close_price = float(await self.price(symbol_for_price))
+            except Exception:
+                close_price = None
+
         await self.ensure_ready()
         await self.broker.close_position(position_id)
+
+        if self.repository is not None:
+            try:
+                await self.repository.close_trade(
+                    position_id=str(position_id),
+                    close_reason=close_reason,
+                    close_price=close_price,
+                    metadata={"source": source},
+                )
+            except Exception as exc:
+                print(f"[cTraderClient] trade log close failed for {position_id}: {exc!r}")
 
     async def price(self, symbol: str) -> float:
         await self.ensure_ready()

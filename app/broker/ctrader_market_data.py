@@ -15,6 +15,8 @@ from ctrader_open_api.messages import OpenApiMessages_pb2 as OAMsg
 from twisted.internet import reactor  # type: ignore
 
 from app.config import get_settings
+from app.services.sltp import CTraderOrderError, validate_sl_tp_for_side
+from app.strategies.peak_dip.utils import point_size
 
 settings = get_settings()
 
@@ -324,12 +326,19 @@ class CTraderMarketDataService:
             self._symbol_ids[name_u] = int(sid)
             self._id_to_symbol[int(sid)] = name_u
 
-            # 👉 digits por símbolo (para escalar precios SL/TP)
-            digits = getattr(s, "digits", None)
-            if digits is None:
-                digits = getattr(s, "pipPosition", 5)
+            # digits por simbolo (EURUSD suele 5). Si no viene, derivamos desde pipPosition:
+            # pipPosition=4 -> digits=5, pipPosition=2 -> digits=3.
+            digits_raw = getattr(s, "digits", None)
+            if digits_raw is None:
+                pip_pos = getattr(s, "pipPosition", None)
+                if pip_pos is not None:
+                    try:
+                        digits_raw = int(pip_pos) + 1
+                    except Exception:
+                        digits_raw = None
             try:
-                self._symbol_digits[name_u] = int(digits)
+                digits = int(digits_raw) if digits_raw is not None else 5
+                self._symbol_digits[name_u] = max(0, min(digits, 10))
             except Exception:
                 self._symbol_digits[name_u] = 5  # fallback
 
@@ -713,6 +722,13 @@ class CTraderMarketDataService:
         q = Decimal("1").scaleb(-digits)
         normalized = Decimal(str(price)).quantize(q, rounding=ROUND_HALF_UP)
         return float(format(normalized, f".{digits}f"))
+
+    async def get_symbol_point_size(self, symbol: str) -> float:
+        symbol_u = symbol.upper()
+        await self._ensure_symbols_loaded()
+        digits = int(self._symbol_digits.get(symbol_u, 5))
+        digits = max(0, min(digits, 10))
+        return 10.0 ** (-digits)
 
     async def get_price(self, symbol: str, timeout: float = 5.0) -> float:
         symbol_u = symbol.upper()
@@ -1202,24 +1218,77 @@ class CTraderMarketDataService:
         position_id: int,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
+        clear_stop_loss: bool = False,
+        clear_take_profit: bool = False,
+        wait_error_sec: float = 0.35,
     ) -> Dict[str, Any]:
         """
-        Modifica SL/TP de una posición vía ProtoOAAmendPositionSLTPReq.
-
-        - symbol: solo para logging (los precios son absolutos, en float).
-        - position_id: id real de cTrader.
-        - stop_loss / take_profit: precios absolutos (ej. 4257.93).
+        Modifica SL/TP de una posicion via ProtoOAAmendPositionSLTPReq.
         """
         if self._client is None:
-            raise RuntimeError("Cliente OpenAPI aún no inicializado")
+            raise RuntimeError("Cliente OpenAPI aun no inicializado")
 
-        # Nos aseguramos de que ya tenemos sesión y símbolos cargados
         await self._ensure_symbols_loaded()
 
         symbol_u = symbol.upper()
+        raw_request = {
+            "ctidTraderAccountId": CTID_TRADER_ACCOUNT_ID,
+            "positionId": int(position_id),
+            "symbol": symbol_u,
+            "stopLoss": stop_loss,
+            "takeProfit": take_profit,
+            "clearStopLoss": bool(clear_stop_loss),
+            "clearTakeProfit": bool(clear_take_profit),
+        }
 
-        # ⚠️ OJO: en esta request los precios van como float absolutos,
-        # NO hay que escalarlos por digits.
+        if clear_stop_loss and stop_loss is not None:
+            raise ValueError("No se puede enviar stop_loss y clear_stop_loss al mismo tiempo")
+        if clear_take_profit and take_profit is not None:
+            raise ValueError("No se puede enviar take_profit y clear_take_profit al mismo tiempo")
+
+        if stop_loss is not None and float(stop_loss) <= 0:
+            raise ValueError(f"stop_loss invalido (<= 0): {stop_loss}")
+        if take_profit is not None and float(take_profit) <= 0:
+            raise ValueError(f"take_profit invalido (<= 0): {take_profit}")
+
+        positions = await self.get_open_positions()
+        target = None
+        for p in positions:
+            if int(p.get("position_id") or 0) == int(position_id):
+                target = p
+                break
+        if target is None:
+            raise RuntimeError(f"No se encontro position_id={position_id} para AMEND SL/TP")
+
+        entry_price = target.get("open_price")
+        entry_price_value: float | None = None
+        try:
+            entry_price_value = float(entry_price) if entry_price is not None else None
+        except Exception:
+            entry_price_value = None
+
+        trade_side = int(target.get("trade_side") or 0)
+        side = "buy" if trade_side == 1 else "sell" if trade_side == 2 else None
+        if side is None:
+            raise RuntimeError(f"No se pudo resolver trade_side para position_id={position_id}")
+
+        candidate_sl = None if clear_stop_loss else stop_loss
+        candidate_tp = None if clear_take_profit else take_profit
+
+        if entry_price_value is not None and entry_price_value > 0:
+            validate_sl_tp_for_side(
+                side=side,
+                entry_price=entry_price_value,
+                stop_loss=candidate_sl,
+                take_profit=candidate_tp,
+                min_distance=max(point_size(symbol_u), 1e-6),
+            )
+        else:
+            print(
+                f"[MD] open_price no confirmado para positionId={position_id}; "
+                "se omite validacion de coherencia SL/TP por lado en este intento."
+            )
+
         req = OAMsg.ProtoOAAmendPositionSLTPReq()
         req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
         req.positionId = int(position_id)
@@ -1227,29 +1296,56 @@ class CTraderMarketDataService:
         normalized_sl = self._normalize_price_for_symbol(symbol_u, float(stop_loss)) if stop_loss is not None else None
         normalized_tp = self._normalize_price_for_symbol(symbol_u, float(take_profit)) if take_profit is not None else None
 
+        if clear_stop_loss:
+            normalized_sl = 0.0
+        if clear_take_profit:
+            normalized_tp = 0.0
+
         if normalized_sl is not None:
             req.stopLoss = normalized_sl
-
         if normalized_tp is not None:
             req.takeProfit = normalized_tp
 
         print(
-            f"[MD] Enviando AMEND SL/TP → positionId={position_id}, "
+            f"[MD] Enviando AMEND SL/TP -> positionId={position_id}, "
             f"symbol={symbol_u}, SL={normalized_sl}, TP={normalized_tp}"
         )
 
+        send_ts = time.time()
         d = self._client.send(req)
         d.addErrback(self._on_error)
 
-        # De momento no esperamos ExecutionEvent específico
+        deadline = time.monotonic() + max(0.0, wait_error_sec)
+        while time.monotonic() < deadline:
+            last_err = self._last_order_error
+            if last_err:
+                err_ts = float(last_err.get("ts") or 0.0)
+                err_pos_id = last_err.get("positionId")
+                if err_ts >= send_ts and (err_pos_id is None or int(err_pos_id) == int(position_id)):
+                    raise CTraderOrderError(
+                        error_code=str(last_err.get("errorCode") or "UNKNOWN"),
+                        description=str(last_err.get("description") or "sin descripcion"),
+                        position_id=int(position_id),
+                        raw_request={
+                            **raw_request,
+                            "normalizedStopLoss": normalized_sl,
+                            "normalizedTakeProfit": normalized_tp,
+                        },
+                    )
+            await asyncio.sleep(0.05)
+
         return {
             "sent": True,
             "positionId": position_id,
             "symbol": symbol_u,
             "stopLoss": normalized_sl,
             "takeProfit": normalized_tp,
+            "raw_request": {
+                **raw_request,
+                "normalizedStopLoss": normalized_sl,
+                "normalizedTakeProfit": normalized_tp,
+            },
         }
-
     async def subscribe(self, symbol: str) -> asyncio.Queue[Quote]:
         """
         Crea una cola de quotes para ese símbolo y la registra como listener.
@@ -1347,11 +1443,16 @@ async def unsubscribe_quotes(symbol: str, queue: asyncio.Queue[Quote]) -> None:
 async def get_trendbars(symbol: str, timeframe: str, count: int = 200) -> pd.DataFrame:
     return await _market_data_service.get_trendbars(symbol, timeframe, count)
 
+async def get_symbol_point_size(symbol: str) -> float:
+    return await _market_data_service.get_symbol_point_size(symbol)
+
 async def set_position_sl_tp(
     symbol: str,
     position_id: int,
     stop_loss: Optional[float] = None,
     take_profit: Optional[float] = None,
+    clear_stop_loss: bool = False,
+    clear_take_profit: bool = False,
 ) -> Dict[str, Any]:
     """
     Helper global para modificar SL/TP de una posición usando el singleton.
@@ -1361,7 +1462,10 @@ async def set_position_sl_tp(
         position_id=position_id,
         stop_loss=stop_loss,
         take_profit=take_profit,
+        clear_stop_loss=clear_stop_loss,
+        clear_take_profit=clear_take_profit,
     )
+
 
 
 

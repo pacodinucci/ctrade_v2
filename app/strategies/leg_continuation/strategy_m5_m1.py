@@ -106,6 +106,9 @@ class LegContinuationM5M1Strategy:
                 symbol=self.symbol,
                 side=setup.side,
                 volume=self.volume,
+                bot_id=getattr(self, "bot_id", None),
+                strategy=getattr(self, "strategy_id", self.name),
+                source="bot",
                 sl_points=self.sl_points,
                 tp_points=self.tp_points,
             )

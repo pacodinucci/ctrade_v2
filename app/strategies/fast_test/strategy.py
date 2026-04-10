@@ -94,6 +94,9 @@ class FastTestStrategy:
                     symbol=self.symbol,
                     side=self.side,
                     volume=self.volume,
+                    bot_id=getattr(self, "bot_id", None),
+                    strategy=getattr(self, "strategy_id", self.name),
+                    source="bot",
                     sl_points=self.sl_points,
                     tp_points=self.tp_points,
                 )
@@ -104,7 +107,11 @@ class FastTestStrategy:
                 await asyncio.sleep(self.hold_sec)
 
                 if self._last_position_id and self._last_position_id.isdigit():
-                    await self.client.close_trade(int(self._last_position_id))
+                    await self.client.close_trade(
+                        int(self._last_position_id),
+                        close_reason="STRATEGY_CLOSE",
+                        source="bot",
+                    )
                     self._last_event = "CLOSED"
                     self._last_event_time = datetime.now(timezone.utc).isoformat()
 

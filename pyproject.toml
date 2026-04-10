@@ -22,6 +22,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
 
+[project.scripts]
+dev = "app.main:run_dev_server"
+
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"

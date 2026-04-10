@@ -5,6 +5,7 @@ import sys
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+import uvicorn
 
 from app.api.routes import router
 from app.api.routes_manual import router as manual_router
@@ -18,8 +19,8 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 app = FastAPI()
-client = cTraderClient()
 bot_repository = BotRepository()
+client = cTraderClient(repository=bot_repository)
 bot_manager = BotManager(client, repository=bot_repository)
 alert_service = get_whatsapp_alert_service()
 
@@ -85,3 +86,7 @@ async def alerts_test_whatsapp():
         return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
 
     return {"ok": True, "message": "Alert processed (si estaba configurado, se envio)."}
+
+
+def run_dev_server() -> None:
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

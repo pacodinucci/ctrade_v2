@@ -1,0 +1,2 @@
+[console_scripts]
+dev = app.main:run_dev_server

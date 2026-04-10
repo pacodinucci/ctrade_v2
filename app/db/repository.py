@@ -29,6 +29,22 @@ class BotCreateInput:
     account_id: str | None = None
 
 
+@dataclass
+class TradeCreateInput:
+    position_id: str
+    symbol: str
+    side: str
+    volume: float
+    source: str
+    bot_id: str | None = None
+    strategy: str | None = None
+    open_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    opened_at: datetime | None = None
+    metadata: dict[str, Any] | None = None
+
+
 class BotRepository:
     def __init__(self, database_url: str | None = None) -> None:
         settings = get_settings()
@@ -378,6 +394,189 @@ class BotRepository:
         normalized.reverse()
         return normalized
 
+    async def create_trade(self, payload: TradeCreateInput) -> None:
+        if not self._database_url:
+            return
+        self._ensure_driver()
+
+        opened_at = (payload.opened_at or datetime.now(timezone.utc)).replace(tzinfo=None)
+        query = """
+            INSERT INTO public."BotTradeLog" (
+                "id",
+                "positionId",
+                "botId",
+                "source",
+                "strategy",
+                "symbol",
+                "side",
+                "volume",
+                "openPrice",
+                "stopLoss",
+                "takeProfit",
+                "openedAt",
+                "closedAt",
+                "status",
+                "closeReason",
+                "closePrice",
+                "pnl",
+                "metadata"
+            )
+            VALUES (
+                %(id)s,
+                %(position_id)s,
+                %(bot_id)s,
+                %(source)s,
+                %(strategy)s,
+                %(symbol)s,
+                %(side)s,
+                %(volume)s,
+                %(open_price)s,
+                %(stop_loss)s,
+                %(take_profit)s,
+                %(opened_at)s,
+                NULL,
+                'OPEN',
+                NULL,
+                NULL,
+                NULL,
+                %(metadata)s::jsonb
+            )
+            ON CONFLICT ("positionId")
+            DO UPDATE SET
+                "botId" = COALESCE(EXCLUDED."botId", public."BotTradeLog"."botId"),
+                "source" = EXCLUDED."source",
+                "strategy" = COALESCE(EXCLUDED."strategy", public."BotTradeLog"."strategy"),
+                "symbol" = EXCLUDED."symbol",
+                "side" = EXCLUDED."side",
+                "volume" = EXCLUDED."volume",
+                "openPrice" = COALESCE(EXCLUDED."openPrice", public."BotTradeLog"."openPrice"),
+                "stopLoss" = COALESCE(EXCLUDED."stopLoss", public."BotTradeLog"."stopLoss"),
+                "takeProfit" = COALESCE(EXCLUDED."takeProfit", public."BotTradeLog"."takeProfit"),
+                "openedAt" = EXCLUDED."openedAt",
+                "metadata" = COALESCE(public."BotTradeLog"."metadata", '{}'::jsonb) || EXCLUDED."metadata"
+        """
+        params = {
+            "id": str(uuid.uuid4()),
+            "position_id": payload.position_id,
+            "bot_id": payload.bot_id,
+            "source": payload.source,
+            "strategy": payload.strategy,
+            "symbol": payload.symbol.upper(),
+            "side": payload.side.lower(),
+            "volume": float(payload.volume),
+            "open_price": payload.open_price,
+            "stop_loss": payload.stop_loss,
+            "take_profit": payload.take_profit,
+            "opened_at": opened_at,
+            "metadata": json.dumps(payload.metadata or {}),
+        }
+        await self._execute_write(query, params)
+
+    async def close_trade(
+        self,
+        *,
+        position_id: str,
+        close_reason: str,
+        close_price: float | None = None,
+        closed_at: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        if not self._database_url:
+            return False
+        self._ensure_driver()
+
+        ts = (closed_at or datetime.now(timezone.utc)).replace(tzinfo=None)
+        query = """
+            UPDATE public."BotTradeLog"
+            SET
+                "status" = 'CLOSED',
+                "closedAt" = %(closed_at)s,
+                "closeReason" = %(close_reason)s,
+                "closePrice" = %(close_price)s,
+                "pnl" = CASE
+                    WHEN %(close_price)s IS NULL OR "openPrice" IS NULL THEN NULL
+                    WHEN LOWER(COALESCE("side", '')) = 'buy' THEN (%(close_price)s - "openPrice") * "volume"
+                    ELSE ("openPrice" - %(close_price)s) * "volume"
+                END,
+                "metadata" = COALESCE("metadata", '{}'::jsonb) || %(metadata)s::jsonb
+            WHERE "positionId" = %(position_id)s
+        """
+        params = {
+            "position_id": position_id,
+            "closed_at": ts,
+            "close_reason": close_reason,
+            "close_price": close_price,
+            "metadata": json.dumps(metadata or {}),
+        }
+        updated_rows = await self._execute_write(query, params)
+        return updated_rows > 0
+
+    async def list_trades(
+        self,
+        *,
+        limit: int = 200,
+        bot_id: str | None = None,
+        symbol: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self._database_url:
+            return []
+        self._ensure_driver(require_dict=True)
+
+        query = """
+            SELECT
+                t."id",
+                t."positionId",
+                t."botId",
+                t."source",
+                t."strategy",
+                t."symbol",
+                t."side",
+                t."volume",
+                t."openPrice",
+                t."stopLoss",
+                t."takeProfit",
+                t."openedAt",
+                t."closedAt",
+                t."status",
+                t."closeReason",
+                t."closePrice",
+                t."pnl",
+                COALESCE(t."metadata", '{}'::jsonb) AS "metadata"
+            FROM public."BotTradeLog" t
+            WHERE (%(bot_id)s::text IS NULL OR t."botId" = %(bot_id)s)
+              AND (%(symbol)s::text IS NULL OR t."symbol" = %(symbol)s)
+              AND (
+                    %(status)s::text IS NULL
+                    OR %(status)s = 'ALL'
+                    OR t."status" = %(status)s
+              )
+            ORDER BY t."openedAt" DESC
+            LIMIT %(limit)s
+        """
+        rows = await self._fetchall_dict(
+            query,
+            {
+                "bot_id": bot_id,
+                "symbol": symbol.upper() if symbol else None,
+                "status": status.upper() if status else None,
+                "limit": max(1, min(limit, 2000)),
+            },
+        )
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw_metadata = item.get("metadata")
+            if isinstance(raw_metadata, str):
+                try:
+                    item["metadata"] = json.loads(raw_metadata)
+                except json.JSONDecodeError:
+                    item["metadata"] = {}
+            elif raw_metadata is None:
+                item["metadata"] = {}
+            normalized.append(item)
+        return normalized
+
     async def ensure_schema(self) -> None:
         if not self._database_url:
             return
@@ -427,6 +626,32 @@ class BotRepository:
             CREATE INDEX IF NOT EXISTS idx_bot_event_log_bot_time
             ON public."BotEventLog" ("botId", "timeUtc" DESC)
         """
+        query_trade_logs = """
+            CREATE TABLE IF NOT EXISTS public."BotTradeLog" (
+                "id" text PRIMARY KEY,
+                "positionId" text NOT NULL UNIQUE,
+                "botId" text NULL REFERENCES public."Bot"("id") ON DELETE SET NULL,
+                "source" text NOT NULL DEFAULT 'bot',
+                "strategy" text NULL,
+                "symbol" text NOT NULL,
+                "side" text NOT NULL,
+                "volume" double precision NOT NULL,
+                "openPrice" double precision NULL,
+                "stopLoss" double precision NULL,
+                "takeProfit" double precision NULL,
+                "openedAt" timestamp without time zone NOT NULL,
+                "closedAt" timestamp without time zone NULL,
+                "status" text NOT NULL DEFAULT 'OPEN',
+                "closeReason" text NULL,
+                "closePrice" double precision NULL,
+                "pnl" double precision NULL,
+                "metadata" jsonb NOT NULL DEFAULT '{}'::jsonb
+            )
+        """
+        query_trade_logs_idx = """
+            CREATE INDEX IF NOT EXISTS idx_bot_trade_log_opened
+            ON public."BotTradeLog" ("openedAt" DESC)
+        """
 
         if self._use_sync_driver:
             await asyncio.to_thread(
@@ -438,6 +663,8 @@ class BotRepository:
                 query_set_default_strategy,
                 query_logs,
                 query_logs_idx,
+                query_trade_logs,
+                query_trade_logs_idx,
             )
             return
 
@@ -450,6 +677,8 @@ class BotRepository:
                 await cur.execute(query_set_default_strategy)
                 await cur.execute(query_logs)
                 await cur.execute(query_logs_idx)
+                await cur.execute(query_trade_logs)
+                await cur.execute(query_trade_logs_idx)
             await conn.commit()
 
     @staticmethod
@@ -562,6 +791,8 @@ class BotRepository:
         query_set_default_strategy: str,
         query_logs: str,
         query_logs_idx: str,
+        query_trade_logs: str,
+        query_trade_logs_idx: str,
     ) -> None:
         with psycopg.connect(self._database_url) as conn:
             with conn.cursor() as cur:
@@ -572,6 +803,8 @@ class BotRepository:
                 cur.execute(query_set_default_strategy)
                 cur.execute(query_logs)
                 cur.execute(query_logs_idx)
+                cur.execute(query_trade_logs)
+                cur.execute(query_trade_logs_idx)
             conn.commit()
 
 

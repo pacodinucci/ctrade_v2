@@ -65,6 +65,19 @@ def _extract_strategy_params(payload: dict) -> dict:
     return params
 
 
+def _serialize_registry_trade(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    for key in ("openedAt", "closedAt"):
+        value = item.get(key)
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            else:
+                value = value.astimezone(timezone.utc)
+            item[key] = value.isoformat().replace("+00:00", "Z")
+    return item
+
+
 @router.get("/strategies")
 async def list_strategies(manager: BotManager = Depends(get_bot_manager)):
     strategies = await manager.list_strategies()
@@ -306,6 +319,51 @@ async def get_bot_logs(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not get logs: {exc}") from exc
     return {"bot_id": bot_id, "count": len(logs), "logs": logs}
+
+
+@router.get("/registro")
+async def get_trade_registry(
+    limit: int = Query(default=200, ge=1, le=2000),
+    status: str = Query(default="ALL"),
+    symbol: str | None = Query(default=None),
+    manager: BotManager = Depends(get_bot_manager),
+):
+    try:
+        rows = await manager.list_trade_registry(
+            limit=limit,
+            status=status,
+            symbol=(symbol.strip().upper() if symbol else None),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not get registro: {exc}") from exc
+
+    trades = [_serialize_registry_trade(row) for row in rows]
+    return {
+        "count": len(trades),
+        "filters": {"limit": limit, "status": status.upper(), "symbol": symbol.strip().upper() if symbol else None},
+        "trades": trades,
+    }
+
+
+@router.get("/bots/{bot_id}/registro")
+async def get_bot_trade_registry(
+    bot_id: str,
+    limit: int = Query(default=200, ge=1, le=2000),
+    status: str = Query(default="ALL"),
+    manager: BotManager = Depends(get_bot_manager),
+):
+    try:
+        rows = await manager.list_trade_registry(limit=limit, bot_id=bot_id, status=status)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not get bot registro: {exc}") from exc
+
+    trades = [_serialize_registry_trade(row) for row in rows]
+    return {
+        "bot_id": bot_id,
+        "count": len(trades),
+        "filters": {"limit": limit, "status": status.upper()},
+        "trades": trades,
+    }
 
 
 @router.post("/bots/{bot_id}/dry-run")

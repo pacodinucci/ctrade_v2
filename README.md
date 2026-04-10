@@ -43,7 +43,7 @@ DATABASE_URL=postgresql://user:pass@host:5432/dbname?sslmode=require
 ```
 cd ctrade_v2
 uv sync   # o: pip install -r requirements.txt (si preferís pip)
-uv run app/main.py  # uvicorn app.main:app --reload
+uv run dev  # equivalente a: uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ## Endpoints iniciales
