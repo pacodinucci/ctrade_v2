@@ -137,6 +137,8 @@ def _normalize_leg_continuation_params(strategy_params: dict[str, Any] | None) -
     tp_points = int(params.get("tp_points", 200))
     pivot_strength = int(params.get("pivot_strength", 2))
     leg_mode = str(params.get("leg_mode", "extended")).strip().lower()
+    retest_tolerance_points = float(params.get("retest_tolerance_points", 10.0))
+    rejection_wick_ratio = float(params.get("rejection_wick_ratio", 1.5))
 
     if volume < 100000:
         raise ValueError("volume debe ser >= 100000")
@@ -146,6 +148,10 @@ def _normalize_leg_continuation_params(strategy_params: dict[str, Any] | None) -
         raise ValueError("pivot_strength debe ser >= 1")
     if leg_mode != "extended":
         raise ValueError("leg_mode debe ser 'extended'")
+    if retest_tolerance_points < 0:
+        raise ValueError("retest_tolerance_points debe ser >= 0")
+    if rejection_wick_ratio <= 0:
+        raise ValueError("rejection_wick_ratio debe ser > 0")
 
     return {
         "volume": volume,
@@ -153,6 +159,8 @@ def _normalize_leg_continuation_params(strategy_params: dict[str, Any] | None) -
         "tp_points": tp_points,
         "pivot_strength": pivot_strength,
         "leg_mode": leg_mode,
+        "retest_tolerance_points": retest_tolerance_points,
+        "rejection_wick_ratio": rejection_wick_ratio,
     }
 
 
@@ -169,6 +177,8 @@ def _create_leg_continuation_runtime(
         tp_points=int(params["tp_points"]),
         pivot_strength=int(params["pivot_strength"]),
         leg_mode=str(params["leg_mode"]),
+        retest_tolerance_points=float(params["retest_tolerance_points"]),
+        rejection_wick_ratio=float(params["rejection_wick_ratio"]),
     )
 
 
@@ -185,6 +195,8 @@ def _create_leg_continuation_m5_m1_runtime(
         tp_points=int(params["tp_points"]),
         pivot_strength=int(params["pivot_strength"]),
         leg_mode=str(params["leg_mode"]),
+        retest_tolerance_points=float(params["retest_tolerance_points"]),
+        rejection_wick_ratio=float(params["rejection_wick_ratio"]),
     )
 
 
@@ -286,6 +298,8 @@ _REGISTRY: dict[str, StrategyDefinition] = {
             StrategyParamDef(key="tp_points", type="int", required=True, default=200),
             StrategyParamDef(key="pivot_strength", type="int", required=True, default=2),
             StrategyParamDef(key="leg_mode", type="string", required=True, default="extended"),
+            StrategyParamDef(key="retest_tolerance_points", type="float", required=False, default=10.0),
+            StrategyParamDef(key="rejection_wick_ratio", type="float", required=False, default=1.5),
         ),
         normalize_params=_normalize_leg_continuation_params,
         create_runtime=_create_leg_continuation_runtime,
@@ -300,6 +314,8 @@ _REGISTRY: dict[str, StrategyDefinition] = {
             StrategyParamDef(key="tp_points", type="int", required=True, default=200),
             StrategyParamDef(key="pivot_strength", type="int", required=True, default=2),
             StrategyParamDef(key="leg_mode", type="string", required=True, default="extended"),
+            StrategyParamDef(key="retest_tolerance_points", type="float", required=False, default=10.0),
+            StrategyParamDef(key="rejection_wick_ratio", type="float", required=False, default=1.5),
         ),
         normalize_params=_normalize_leg_continuation_params,
         create_runtime=_create_leg_continuation_m5_m1_runtime,

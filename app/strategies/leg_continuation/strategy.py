@@ -20,6 +20,8 @@ class PendingSetup:
     search_start: pd.Timestamp
     search_end: pd.Timestamp
     breakout_time: pd.Timestamp | None = None
+    breakout_close: float | None = None
+    entry_retest_done: bool = False
 
 
 class LegContinuationH4M15Strategy:
@@ -36,6 +38,8 @@ class LegContinuationH4M15Strategy:
         leg_mode: str = "extended",
         sl_points: int = 100,
         tp_points: int = 200,
+        retest_tolerance_points: float = 10.0,
+        rejection_wick_ratio: float = 1.5,
     ) -> None:
         if int(pivot_strength) < 1:
             raise ValueError("pivot_strength debe ser >= 1")
@@ -49,10 +53,15 @@ class LegContinuationH4M15Strategy:
         self.leg_mode = "extended"
         self.sl_points = int(sl_points)
         self.tp_points = int(tp_points)
+        self._retest_tolerance_points = float(retest_tolerance_points)
+        self._rejection_wick_ratio = float(rejection_wick_ratio)
+        if self._retest_tolerance_points < 0:
+            raise ValueError("retest_tolerance_points debe ser >= 0")
+        if self._rejection_wick_ratio <= 0:
+            raise ValueError("rejection_wick_ratio debe ser > 0")
 
         self._h4: Deque[dict[str, Any]] = deque(maxlen=500)
         self._m15: Deque[dict[str, Any]] = deque(maxlen=1200)
-        self._known_setup_ids: set[str] = set()
         self._pending: Deque[PendingSetup] = deque()
 
     async def on_h4_close(self, candle: dict) -> None:
@@ -72,16 +81,21 @@ class LegContinuationH4M15Strategy:
             if setup.breakout_time is None and now > setup.search_start:
                 if self._is_level_break(side=setup.side, close_px=close_px, level=setup.continuation_level):
                     setup.breakout_time = now
+                    setup.breakout_close = close_px
             active.append(setup)
         self._pending = active
 
     async def on_m15_close(self, candle: dict) -> None:
-        self._m15.append(self._normalize_candle(candle))
+        c = self._normalize_candle(candle)
+        self._m15.append(c)
         now = ensure_utc_timestamp(candle["time_utc"])
         if not self._pending:
             return
 
-        close_px = float(candle["close"])
+        close_px = float(c["close"])
+        open_px = float(c["open"])
+        high_px = float(c["high"])
+        low_px = float(c["low"])
         active: Deque[PendingSetup] = deque()
         opened = False
 
@@ -95,7 +109,29 @@ class LegContinuationH4M15Strategy:
             if now <= setup.breakout_time:
                 active.append(setup)
                 continue
-            if not self._is_level_break(side=setup.side, close_px=close_px, level=setup.continuation_level):
+
+            # Trigger en timeframe menor:
+            # 1) usar el cierre de la vela MAYOR que confirmo breakout
+            # 2) esperar retest de ese nivel de cierre
+            # 3) esperar nuevo cierre a favor por encima/debajo de ese nivel
+            if setup.breakout_close is None:
+                active.append(setup)
+                continue
+
+            if not setup.entry_retest_done:
+                if self._did_retest_close_level(
+                    side=setup.side,
+                    open_px=open_px,
+                    close_px=close_px,
+                    high_px=high_px,
+                    low_px=low_px,
+                    break_close=setup.breakout_close,
+                ):
+                    setup.entry_retest_done = True
+                active.append(setup)
+                continue
+
+            if not self._is_level_break(side=setup.side, close_px=close_px, level=setup.breakout_close):
                 active.append(setup)
                 continue
 
@@ -144,6 +180,7 @@ class LegContinuationH4M15Strategy:
                 "search_start": first.search_start.isoformat(),
                 "search_end": first.search_end.isoformat(),
                 "breakout_time": first.breakout_time.isoformat() if first.breakout_time is not None else None,
+                "breakout_close": first.breakout_close,
             }
 
         payload["h4_last_4"] = list(self._h4)[-4:]
@@ -154,57 +191,91 @@ class LegContinuationH4M15Strategy:
         h4 = pd.DataFrame(list(self._h4))
         h4["time_utc"] = pd.to_datetime(h4["time_utc"], utc=True)
         h4 = h4.sort_values("time_utc").reset_index(drop=True)
+        current_h4_time = pd.Timestamp(h4["time_utc"].max()).tz_convert("UTC")
 
         pivots = compress_pivots(find_pivots(h4, strength=self.pivot_strength))
         legs = build_legs_extended(pivots)
-        if legs.empty or len(legs) < 3:
+        if legs.empty or len(legs) < 2:
+            self._pending.clear()
             return
 
-        setups: list[PendingSetup] = []
-        for i in range(2, len(legs)):
-            leg_a = legs.iloc[i - 2]
-            leg_b = legs.iloc[i - 1]
-            leg_c = legs.iloc[i]
+        # Nuevo enfoque: setup con AB confirmado, C en formacion.
+        leg_a = legs.iloc[-2]
+        leg_b = legs.iloc[-1]
 
-            if leg_a["leg_type"] == "bullish" and leg_b["leg_type"] == "bearish" and leg_c["leg_type"] == "bullish":
-                side = "buy"
-            elif leg_a["leg_type"] == "bearish" and leg_b["leg_type"] == "bullish" and leg_c["leg_type"] == "bearish":
-                side = "sell"
-            else:
-                continue
+        if leg_a["leg_type"] == "bullish" and leg_b["leg_type"] == "bearish":
+            side = "buy"
+        elif leg_a["leg_type"] == "bearish" and leg_b["leg_type"] == "bullish":
+            side = "sell"
+        else:
+            self._pending.clear()
+            return
 
-            continuation_level = float(leg_a["end_price"])
-            search_start = pd.Timestamp(leg_c["start_time"]).tz_convert("UTC")
-            if i + 1 < len(legs):
-                search_end = pd.Timestamp(legs.iloc[i + 1]["start_time"]).tz_convert("UTC")
-            else:
-                search_end = pd.Timestamp(h4["time_utc"].max()).tz_convert("UTC") + pd.Timedelta(hours=4)
+        continuation_level = float(leg_a["end_price"])
+        search_start = pd.Timestamp(leg_b["end_time"]).tz_convert("UTC")
+        search_end = current_h4_time + pd.Timedelta(hours=4)
 
-            setup_id = self._build_setup_id(
-                side=side,
-                continuation_level=continuation_level,
-                leg_a_end_time=pd.Timestamp(leg_a["end_time"]).tz_convert("UTC"),
-                leg_b_end_time=pd.Timestamp(leg_b["end_time"]).tz_convert("UTC"),
-                leg_c_start_time=pd.Timestamp(leg_c["start_time"]).tz_convert("UTC"),
-            )
-            if setup_id in self._known_setup_ids:
-                continue
+        setup_id = self._build_setup_id(
+            side=side,
+            continuation_level=continuation_level,
+            leg_a_end_time=pd.Timestamp(leg_a["end_time"]).tz_convert("UTC"),
+            leg_b_end_time=pd.Timestamp(leg_b["end_time"]).tz_convert("UTC"),
+        )
 
-            self._known_setup_ids.add(setup_id)
-            setups.append(
+        prev_breakout: pd.Timestamp | None = None
+        if self._pending and self._pending[0].setup_id == setup_id:
+            prev_breakout = self._pending[0].breakout_time
+
+        breakout_time, breakout_close = self._resolve_breakout_from_h4_history(
+            h4=h4,
+            side=side,
+            continuation_level=continuation_level,
+            search_start=search_start,
+            search_end=current_h4_time,
+        )
+        if breakout_time is None:
+            breakout_time = prev_breakout
+            if self._pending and self._pending[0].setup_id == setup_id:
+                breakout_close = self._pending[0].breakout_close
+
+        self._pending = deque(
+            [
                 PendingSetup(
                     setup_id=setup_id,
                     side=side,
                     continuation_level=continuation_level,
                     search_start=search_start,
                     search_end=search_end,
+                    breakout_time=breakout_time,
+                    breakout_close=breakout_close,
                 )
-            )
+            ]
+        )
 
-        if not setups:
-            return
-        setups.sort(key=lambda x: x.search_start)
-        self._pending.extend(setups)
+    def _resolve_breakout_from_h4_history(
+        self,
+        *,
+        h4: pd.DataFrame,
+        side: str,
+        continuation_level: float,
+        search_start: pd.Timestamp,
+        search_end: pd.Timestamp,
+    ) -> tuple[pd.Timestamp | None, float | None]:
+        window = h4[
+            (h4["time_utc"] > search_start)
+            & (h4["time_utc"] <= search_end)
+        ]
+        if window.empty:
+            return None, None
+
+        for row in window.itertuples(index=False):
+            if self._is_level_break(
+                side=side,
+                close_px=float(row.close),
+                level=continuation_level,
+            ):
+                return ensure_utc_timestamp(row.time_utc), float(row.close)
+        return None, None
 
     def _build_setup_id(
         self,
@@ -213,13 +284,11 @@ class LegContinuationH4M15Strategy:
         continuation_level: float,
         leg_a_end_time: pd.Timestamp,
         leg_b_end_time: pd.Timestamp,
-        leg_c_start_time: pd.Timestamp,
     ) -> str:
         return (
             f"{side}|{continuation_level:.8f}|"
             f"{ensure_utc_timestamp(leg_a_end_time).isoformat()}|"
-            f"{ensure_utc_timestamp(leg_b_end_time).isoformat()}|"
-            f"{ensure_utc_timestamp(leg_c_start_time).isoformat()}"
+            f"{ensure_utc_timestamp(leg_b_end_time).isoformat()}"
         )
 
     @staticmethod
@@ -238,6 +307,49 @@ class LegContinuationH4M15Strategy:
         if side_u == "buy":
             return float(close_px) > float(level)
         return float(close_px) < float(level)
+
+    @staticmethod
+    def _candle_wicks(*, open_px: float, close_px: float, high_px: float, low_px: float) -> tuple[float, float, float]:
+        body = abs(float(close_px) - float(open_px))
+        upper_wick = float(high_px) - max(float(open_px), float(close_px))
+        lower_wick = min(float(open_px), float(close_px)) - float(low_px)
+        return max(body, 0.0), max(upper_wick, 0.0), max(lower_wick, 0.0)
+
+    def _did_retest_close_level(
+        self,
+        *,
+        side: str,
+        open_px: float,
+        close_px: float,
+        high_px: float,
+        low_px: float,
+        break_close: float,
+    ) -> bool:
+        side_u = str(side).strip().lower()
+        tol = self._retest_tolerance_points * point_size(self.symbol)
+        zone_lo = float(break_close) - tol
+        zone_hi = float(break_close) + tol
+
+        # Opcion 1: el rango de la vela visita la zona tolerada alrededor del nivel.
+        zone_touched = float(low_px) <= zone_hi and float(high_px) >= zone_lo
+        if zone_touched:
+            return True
+
+        # Opcion 2: vela de rechazo (cola larga) cerca de la zona, sin tocar exacto.
+        body, upper_wick, lower_wick = self._candle_wicks(
+            open_px=open_px,
+            close_px=close_px,
+            high_px=high_px,
+            low_px=low_px,
+        )
+        body_ref = max(body, point_size(self.symbol))
+
+        if side_u == "buy":
+            near_zone = float(low_px) <= zone_hi
+            return near_zone and (lower_wick / body_ref) >= self._rejection_wick_ratio
+
+        near_zone = float(high_px) >= zone_lo
+        return near_zone and (upper_wick / body_ref) >= self._rejection_wick_ratio
 
     def build_trade_plan(self, side: str, entry: float) -> dict[str, float | str]:
         pt = point_size(self.symbol)

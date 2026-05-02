@@ -103,6 +103,9 @@ class CTraderMarketDataService:
         self._last_rate_limit_error: Optional[str] = None
         self._rate_limit_error_count: int = 0
         self._log_cooldowns: Dict[str, float] = {}
+        self._deferred_seq: int = 0
+        self._deferred_seq_lock = threading.Lock()
+        self._last_deferred_context: Optional[Dict[str, Any]] = None
 
         # Lanzamos el reactor de Twisted en un thread aparte
         self._start_reactor_thread()
@@ -114,6 +117,71 @@ class CTraderMarketDataService:
             return
         self._log_cooldowns[key] = now
         print(message)
+
+    def _next_deferred_request_id(self, operation: str) -> str:
+        with self._deferred_seq_lock:
+            self._deferred_seq += 1
+            seq = self._deferred_seq
+        return f"{operation}-{int(time.time() * 1000)}-{seq}"
+
+    def _build_deferred_context(
+        self,
+        *,
+        operation: str,
+        request_id: Optional[str] = None,
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        timeout_sec: Optional[float] = None,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        ctx: Dict[str, Any] = {
+            "operation": operation,
+            "request_id": request_id or self._next_deferred_request_id(operation),
+        }
+        if symbol is not None:
+            ctx["symbol"] = symbol
+        if timeframe is not None:
+            ctx["timeframe"] = timeframe
+        if client_order_id is not None:
+            ctx["client_order_id"] = client_order_id
+        if timeout_sec is not None:
+            ctx["timeout_sec"] = float(timeout_sec)
+        if reason is not None:
+            ctx["reason"] = reason
+        return ctx
+
+    def _deferred_context_text(self, context: Optional[Dict[str, Any]]) -> str:
+        if not context:
+            return "operation=unknown"
+        keys = ("operation", "request_id", "symbol", "timeframe", "client_order_id", "timeout_sec", "reason")
+        parts: List[str] = []
+        for key in keys:
+            value = context.get(key)
+            if value is not None:
+                parts.append(f"{key}={value}")
+        return ", ".join(parts) if parts else "operation=unknown"
+
+    def _track_deferred(self, deferred, context: Dict[str, Any]) -> Dict[str, Any]:
+        print(f"[MD] Deferred create -> {self._deferred_context_text(context)}")
+
+        def _on_errback(failure):
+            self._on_error(failure, context=context)
+            return failure
+
+        deferred.addErrback(_on_errback)
+        return context
+
+    def _cancel_tracked_deferred(self, deferred, context: Dict[str, Any], *, reason: str) -> None:
+        try:
+            deferred.cancel()
+            cancelled = True
+        except Exception:
+            cancelled = False
+        print(
+            "[MD] Deferred cancel -> "
+            f"{self._deferred_context_text(context)}, cancel_reason={reason}, cancelled={cancelled}"
+        )
 
     # ---------- Twisted / OpenAPI setup ----------
 
@@ -189,6 +257,7 @@ class CTraderMarketDataService:
             "deferred_timeout_count": self._deferred_timeout_count,
             "deferred_error_count": self._deferred_error_count,
             "last_deferred_error": self._last_deferred_error,
+            "last_deferred_context": self._last_deferred_context,
             "last_error": self._last_state_error,
         }
 
@@ -205,7 +274,8 @@ class CTraderMarketDataService:
         req.clientSecret = settings.CTRADER_CLIENT_SECRET
 
         d = client.send(req)
-        d.addErrback(self._on_error)
+        ctx = self._build_deferred_context(operation="application_auth", timeout_sec=5.0)
+        self._track_deferred(d, ctx)
 
     def _on_disconnected(self, client: Client, reason) -> None:
         print("[MD] Desconectado:", reason)
@@ -255,16 +325,31 @@ class CTraderMarketDataService:
                 interval_sec=15.0,
             )
 
-    def _on_error(self, failure) -> None:
+    def _on_error(self, failure, *, context: Optional[Dict[str, Any]] = None) -> None:
         error_text = str(failure)
         self._last_deferred_error = error_text
+        self._last_deferred_context = context
+        context_text = self._deferred_context_text(context)
         if "TimeoutError" in error_text:
             self._deferred_timeout_count += 1
+            is_bootstrap_ready = self._account_ready_flag.is_set() and self._symbols_ready_flag.is_set()
+            if self._connection_state == "READY" and is_bootstrap_ready:
+                # Timeout parcial con sesion ya lista: mantenemos READY.
+                self._last_state_error = error_text
+                self._log_with_cooldown(
+                    "deferred_timeout_non_fatal",
+                    (
+                        "[MD] Deferred timeout no-fatal (READY preservado), "
+                        f"count={self._deferred_timeout_count}, {context_text}"
+                    ),
+                    interval_sec=10.0,
+                )
+                return
             self._log_with_cooldown(
                 "deferred_timeout",
                 (
                     "[MD] Deferred timeout en Open API (throttled), "
-                    f"count={self._deferred_timeout_count}"
+                    f"count={self._deferred_timeout_count}, {context_text}"
                 ),
                 interval_sec=20.0,
             )
@@ -272,7 +357,7 @@ class CTraderMarketDataService:
             self._deferred_error_count += 1
             self._log_with_cooldown(
                 f"deferred_error_{error_text[:80]}",
-                f"[MD] Error en mensaje (Deferred): {error_text}",
+                f"[MD] Error en mensaje (Deferred): {error_text}, {context_text}",
                 interval_sec=20.0,
             )
         self._set_connection_state("ERROR", error=str(failure))
@@ -292,7 +377,8 @@ class CTraderMarketDataService:
         req.accessToken = settings.CTRADER_ACCESS_TOKEN
 
         d = client.send(req)
-        d.addErrback(self._on_error)
+        ctx = self._build_deferred_context(operation="account_auth", timeout_sec=5.0)
+        self._track_deferred(d, ctx)
 
     def _on_account_auth_res(
         self,
@@ -307,7 +393,8 @@ class CTraderMarketDataService:
         req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
 
         d = client.send(req)
-        d.addErrback(self._on_error)
+        ctx = self._build_deferred_context(operation="symbols_list", timeout_sec=5.0)
+        self._track_deferred(d, ctx)
 
     def _on_symbols_list_res(
         self,
@@ -568,7 +655,12 @@ class CTraderMarketDataService:
             req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
             req.accessToken = settings.CTRADER_ACCESS_TOKEN
             d = self._client.send(req)
-            d.addErrback(self._on_error)
+            ctx = self._build_deferred_context(
+                operation="account_auth_retry",
+                timeout_sec=5.0,
+                reason=reason,
+            )
+            self._track_deferred(d, ctx)
 
     async def _request_symbols_list_retry(self, reason: str) -> None:
         await self._ensure_client_ready(timeout=5.0)
@@ -585,7 +677,12 @@ class CTraderMarketDataService:
             req = OAMsg.ProtoOASymbolsListReq()
             req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
             d = self._client.send(req)
-            d.addErrback(self._on_error)
+            ctx = self._build_deferred_context(
+                operation="symbols_list_retry",
+                timeout_sec=5.0,
+                reason=reason,
+            )
+            self._track_deferred(d, ctx)
 
     async def _ensure_client_ready(self, timeout: float = 5.0) -> None:
         self._async_loop = asyncio.get_running_loop()
@@ -665,7 +762,12 @@ class CTraderMarketDataService:
         req.subscribeToSpotTimestamp = False
 
         d = self._client.send(req)
-        d.addErrback(self._on_error)
+        deferred_ctx = self._build_deferred_context(
+            operation="subscribe_spots",
+            symbol=symbol_u,
+            timeout_sec=5.0,
+        )
+        self._track_deferred(d, deferred_ctx)
 
         self._subscribed.add(symbol_u)
         print(f"📡 [MD] Suscripto a spots de {symbol_u} (symbolId={symbol_id})")
@@ -818,6 +920,11 @@ class CTraderMarketDataService:
             except Exception as e:
                 loop.call_soon_threadsafe(self._safe_set_future_exception, future, e)
 
+        deferred_ctx = self._build_deferred_context(
+            operation="reconcile_positions",
+            timeout_sec=timeout,
+        )
+
         def _on_error_deferred(failure):
             loop.call_soon_threadsafe(
                 self._safe_set_future_exception,
@@ -826,12 +933,14 @@ class CTraderMarketDataService:
             )
 
         d = self._client.send(req)
+        self._track_deferred(d, deferred_ctx)
         d.addCallback(_on_reconcile)
         d.addErrback(_on_error_deferred)
 
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
+            self._cancel_tracked_deferred(d, deferred_ctx, reason="await_reconcile_timeout")
             raise RuntimeError("Timeout esperando ProtoOAReconcileRes con posiciones abiertas")
 
     async def get_trendbars(
@@ -926,6 +1035,13 @@ class CTraderMarketDataService:
             except Exception as e:
                 loop.call_soon_threadsafe(self._safe_set_future_exception, fut, e)
 
+        deferred_ctx = self._build_deferred_context(
+            operation="trendbars",
+            symbol=symbol_u,
+            timeframe=timeframe,
+            timeout_sec=timeout,
+        )
+
         def _on_error_deferred(failure):
             loop.call_soon_threadsafe(
                 self._safe_set_future_exception,
@@ -936,6 +1052,7 @@ class CTraderMarketDataService:
         async with self._trendbars_lock:
             await self._throttle_trendbar_request()
             d = self._client.send(req)
+            self._track_deferred(d, deferred_ctx)
             d.addCallback(_on_trendbars)
             d.addErrback(_on_error_deferred)
 
@@ -945,6 +1062,7 @@ class CTraderMarketDataService:
                 self._trendbars_min_gap_sec = max(1.0, self._trendbars_min_gap_sec - 0.1)
                 return result
             except asyncio.TimeoutError:
+                self._cancel_tracked_deferred(d, deferred_ctx, reason="await_trendbars_timeout")
                 self._trendbars_min_gap_sec = min(5.0, self._trendbars_min_gap_sec + 0.5)
                 raise RuntimeError("Timeout esperando trendbars desde cTrader Open API")
     async def has_open_position(
@@ -1039,6 +1157,13 @@ class CTraderMarketDataService:
         self._pending_orders[client_order_id] = fut
 
         d = self._client.send(req)
+        deferred_ctx = self._build_deferred_context(
+            operation="new_market_order",
+            symbol=symbol_u,
+            timeout_sec=timeout,
+            client_order_id=client_order_id,
+        )
+        self._track_deferred(d, deferred_ctx)
 
         def _on_new_order_response(message):
             try:
@@ -1057,7 +1182,6 @@ class CTraderMarketDataService:
                 client_order_id,
                 error=RuntimeError(f"Fallo envio de orden: {failure!r}"),
             )
-            self._on_error(failure)
 
         d.addCallback(_on_new_order_response)
         d.addErrback(_on_new_order_errback)
@@ -1203,7 +1327,11 @@ class CTraderMarketDataService:
         )
 
         d = self._client.send(req)
-        d.addErrback(self._on_error)
+        deferred_ctx = self._build_deferred_context(
+            operation="close_position",
+            timeout_sec=5.0,
+        )
+        self._track_deferred(d, deferred_ctx)
 
         # De momento no esperamos ExecutionEvent de cierre
         return {
@@ -1313,7 +1441,12 @@ class CTraderMarketDataService:
 
         send_ts = time.time()
         d = self._client.send(req)
-        d.addErrback(self._on_error)
+        ctx = self._build_deferred_context(
+            operation="amend_position_sltp",
+            symbol=symbol_u,
+            timeout_sec=5.0,
+        )
+        self._track_deferred(d, ctx)
 
         deadline = time.monotonic() + max(0.0, wait_error_sec)
         while time.monotonic() < deadline:
