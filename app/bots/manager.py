@@ -77,7 +77,25 @@ class BotManager:
             return []
         records = await self.repository.list_bots(user_id=user_id)
         for row in records:
-            row["runtimeActive"] = str(row["id"]) in self.bots
+            bot_id = str(row["id"])
+            is_active = bot_id in self.bots
+            row["runtimeActive"] = is_active
+            row["strategyRuntimeStage"] = None
+
+            if not is_active:
+                continue
+
+            runtime = self.bots.get(bot_id)
+            if runtime is None or not hasattr(runtime, "get_runtime_state"):
+                continue
+
+            try:
+                state = runtime.get_runtime_state()
+                row["strategyRuntimeState"] = state
+                if isinstance(state, dict):
+                    row["strategyRuntimeStage"] = state.get("stage")
+            except Exception as exc:
+                row["strategyRuntimeState"] = {"error": str(exc)}
         return records
 
     async def get_bot(self, bot_id: str) -> dict[str, Any] | None:
