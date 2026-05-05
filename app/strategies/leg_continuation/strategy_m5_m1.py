@@ -16,7 +16,6 @@ from .pivots import build_legs_extended, compress_pivots, find_pivots
 class PendingSetup:
     setup_id: str
     side: str
-    continuation_level: float
     breakout_level: float
     search_start: pd.Timestamp
     search_end: pd.Timestamp
@@ -41,6 +40,7 @@ class LegContinuationM5M1Strategy:
         tp_points: int = 200,
         retest_tolerance_points: float = 10.0,
         rejection_wick_ratio: float = 1.5,
+        setup_stream_grace_seconds: int = 20,
     ) -> None:
         if int(pivot_strength) < 1:
             raise ValueError("pivot_strength debe ser >= 1")
@@ -60,10 +60,15 @@ class LegContinuationM5M1Strategy:
             raise ValueError("retest_tolerance_points debe ser >= 0")
         if self._rejection_wick_ratio <= 0:
             raise ValueError("rejection_wick_ratio debe ser > 0")
+        if int(setup_stream_grace_seconds) < 0:
+            raise ValueError("setup_stream_grace_seconds debe ser >= 0")
 
         self._m5: Deque[dict[str, Any]] = deque(maxlen=900)
         self._m1: Deque[dict[str, Any]] = deque(maxlen=2200)
         self._pending: Deque[PendingSetup] = deque()
+        self._setup_stream_grace = pd.Timedelta(seconds=int(setup_stream_grace_seconds))
+        self._last_setup_status_reason: str = "active"
+        self._last_setup_invalidation_at: pd.Timestamp | None = None
 
     async def on_m5_close(self, candle: dict) -> None:
         self._m5.append(self._normalize_candle(candle))
@@ -78,13 +83,12 @@ class LegContinuationM5M1Strategy:
         while self._pending:
             setup = self._pending.popleft()
             if now > setup.search_end:
+                self._mark_setup_invalidated("expired_window", now)
                 continue
             if now > setup.search_start:
-                # Romper continuation_level no es breakout: solo confirma/expande continuidad.
-                if self._is_level_break(side=setup.side, close_px=close_px, level=setup.continuation_level):
+                if self._is_level_break(side=setup.side, close_px=close_px, level=setup.breakout_level):
                     setup.continuation_extended_at = now
 
-                # Breakout real: ruptura del extremo correctivo.
                 if setup.breakout_confirmed_at is None and self._is_breakout_real(
                     side=setup.side,
                     close_px=close_px,
@@ -112,6 +116,7 @@ class LegContinuationM5M1Strategy:
         while self._pending:
             setup = self._pending.popleft()
             if now > setup.search_end:
+                self._mark_setup_invalidated("expired_window", now)
                 continue
             if setup.breakout_confirmed_at is None:
                 active.append(setup)
@@ -176,6 +181,8 @@ class LegContinuationM5M1Strategy:
             "m1_count": len(self._m1),
             "pivot_strength": self.pivot_strength,
             "pending_setups_count": len(self._pending),
+            "server_now_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+            "setup_status_reason": self._last_setup_status_reason,
         }
 
         if self._pending:
@@ -186,7 +193,6 @@ class LegContinuationM5M1Strategy:
                 payload["stage"] = "WAITING_M5_BREAKOUT"
             payload["current_setup"] = {
                 "side": first.side,
-                "continuation_level": first.continuation_level,
                 "breakout_level": first.breakout_level,
                 "search_start": first.search_start.isoformat(),
                 "search_end": first.search_end.isoformat(),
@@ -202,6 +208,8 @@ class LegContinuationM5M1Strategy:
                 ),
                 "entry_retest_done": bool(first.entry_retest_done),
             }
+        elif self._last_setup_invalidation_at is not None:
+            payload["setup_invalidated_at"] = self._last_setup_invalidation_at.isoformat()
 
         payload["m5_last_4"] = list(self._m5)[-4:]
         payload["m1_last_4"] = list(self._m1)[-4:]
@@ -216,7 +224,10 @@ class LegContinuationM5M1Strategy:
         pivots = compress_pivots(find_pivots(m5, strength=self.pivot_strength))
         legs = build_legs_extended(pivots)
         if legs.empty or len(legs) < 2:
-            self._pending.clear()
+            self._invalidate_or_keep_previous(
+                reason="invalidated_structure",
+                now=current_m5_time,
+            )
             return
 
         # Nuevo enfoque: setup con AB confirmado, C en formacion.
@@ -228,17 +239,20 @@ class LegContinuationM5M1Strategy:
         elif leg_a["leg_type"] == "bearish" and leg_b["leg_type"] == "bullish":
             side = "sell"
         else:
-            self._pending.clear()
+            self._invalidate_or_keep_previous(
+                reason="invalidated_structure",
+                now=current_m5_time,
+            )
             return
 
-        continuation_level = float(leg_a["end_price"])
-        breakout_level = self._resolve_breakout_level(side=side, corrective_leg=leg_b)
+        breakout_level = self._resolve_breakout_target(side=side, impulse_leg=leg_a)
         search_start = pd.Timestamp(leg_b["end_time"]).tz_convert("UTC")
-        search_end = current_m5_time + pd.Timedelta(minutes=5)
+        # time_utc suele representar apertura de vela; usar reloj UTC de servidor
+        # evita expiraciones inmediatas cuando llega el close.
+        search_end = pd.Timestamp.now(tz="UTC") + pd.Timedelta(minutes=5)
 
         setup_id = self._build_setup_id(
             side=side,
-            continuation_level=continuation_level,
             breakout_level=breakout_level,
             leg_a_end_time=pd.Timestamp(leg_a["end_time"]).tz_convert("UTC"),
             leg_b_end_time=pd.Timestamp(leg_b["end_time"]).tz_convert("UTC"),
@@ -255,7 +269,7 @@ class LegContinuationM5M1Strategy:
         continuation_extended_at = self._resolve_continuation_from_m5_history(
             m5=m5,
             side=side,
-            continuation_level=continuation_level,
+            breakout_level=breakout_level,
             search_start=search_start,
             search_end=current_m5_time,
         )
@@ -277,7 +291,6 @@ class LegContinuationM5M1Strategy:
                 PendingSetup(
                     setup_id=setup_id,
                     side=side,
-                    continuation_level=continuation_level,
                     breakout_level=breakout_level,
                     search_start=search_start,
                     search_end=search_end,
@@ -291,13 +304,25 @@ class LegContinuationM5M1Strategy:
                 )
             ]
         )
+        self._last_setup_status_reason = "active"
+
+    def _invalidate_or_keep_previous(self, *, reason: str, now: pd.Timestamp) -> None:
+        if self._pending and now <= (self._pending[0].search_end + self._setup_stream_grace):
+            self._last_setup_status_reason = "stream_gap"
+            return
+        self._pending.clear()
+        self._mark_setup_invalidated(reason, now)
+
+    def _mark_setup_invalidated(self, reason: str, when: pd.Timestamp) -> None:
+        self._last_setup_status_reason = reason
+        self._last_setup_invalidation_at = ensure_utc_timestamp(when)
 
     def _resolve_continuation_from_m5_history(
         self,
         *,
         m5: pd.DataFrame,
         side: str,
-        continuation_level: float,
+        breakout_level: float,
         search_start: pd.Timestamp,
         search_end: pd.Timestamp,
     ) -> pd.Timestamp | None:
@@ -312,7 +337,7 @@ class LegContinuationM5M1Strategy:
             if self._is_level_break(
                 side=side,
                 close_px=float(row.close),
-                level=continuation_level,
+                level=breakout_level,
             ):
                 return ensure_utc_timestamp(row.time_utc)
         return None
@@ -346,25 +371,24 @@ class LegContinuationM5M1Strategy:
         self,
         *,
         side: str,
-        continuation_level: float,
         breakout_level: float,
         leg_a_end_time: pd.Timestamp,
         leg_b_end_time: pd.Timestamp,
     ) -> str:
         return (
-            f"{side}|{continuation_level:.8f}|{breakout_level:.8f}|"
+            f"{side}|{breakout_level:.8f}|"
             f"{ensure_utc_timestamp(leg_a_end_time).isoformat()}|"
             f"{ensure_utc_timestamp(leg_b_end_time).isoformat()}"
         )
 
     @staticmethod
-    def _resolve_breakout_level(*, side: str, corrective_leg: pd.Series) -> float:
-        start_price = float(corrective_leg["start_price"])
-        end_price = float(corrective_leg["end_price"])
+    def _resolve_breakout_target(*, side: str, impulse_leg: pd.Series) -> float:
+        start_price = float(impulse_leg["start_price"])
+        end_price = float(impulse_leg["end_price"])
         side_u = str(side).strip().lower()
         if side_u == "buy":
-            return min(start_price, end_price)
-        return max(start_price, end_price)
+            return max(start_price, end_price)
+        return min(start_price, end_price)
 
     @staticmethod
     def _normalize_candle(candle: dict[str, Any]) -> dict[str, Any]:
@@ -385,10 +409,11 @@ class LegContinuationM5M1Strategy:
 
     @staticmethod
     def _is_breakout_real(*, side: str, close_px: float, breakout_level: float) -> bool:
-        side_u = str(side).strip().lower()
-        if side_u == "buy":
-            return float(close_px) < float(breakout_level)
-        return float(close_px) > float(breakout_level)
+        return LegContinuationM5M1Strategy._is_level_break(
+            side=side,
+            close_px=close_px,
+            level=breakout_level,
+        )
 
     @staticmethod
     def _candle_wicks(*, open_px: float, close_px: float, high_px: float, low_px: float) -> tuple[float, float, float]:

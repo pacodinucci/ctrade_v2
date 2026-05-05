@@ -273,7 +273,7 @@ class CTraderMarketDataService:
         req.clientId = settings.CTRADER_CLIENT_ID
         req.clientSecret = settings.CTRADER_CLIENT_SECRET
 
-        d = client.send(req)
+        d = client.send(req, responseTimeoutInSeconds=10)
         ctx = self._build_deferred_context(operation="application_auth", timeout_sec=5.0)
         self._track_deferred(d, ctx)
 
@@ -376,7 +376,7 @@ class CTraderMarketDataService:
         req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
         req.accessToken = settings.CTRADER_ACCESS_TOKEN
 
-        d = client.send(req)
+        d = client.send(req, responseTimeoutInSeconds=10)
         ctx = self._build_deferred_context(operation="account_auth", timeout_sec=5.0)
         self._track_deferred(d, ctx)
 
@@ -392,7 +392,7 @@ class CTraderMarketDataService:
         req = OAMsg.ProtoOASymbolsListReq()
         req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
 
-        d = client.send(req)
+        d = client.send(req, responseTimeoutInSeconds=10)
         ctx = self._build_deferred_context(operation="symbols_list", timeout_sec=5.0)
         self._track_deferred(d, ctx)
 
@@ -640,7 +640,7 @@ class CTraderMarketDataService:
         self._trendbars_next_allowed_ts = time.monotonic() + self._trendbars_min_gap_sec
 
     async def _request_account_auth_retry(self, reason: str) -> None:
-        await self._ensure_client_ready(timeout=5.0)
+        await self._ensure_client_ready(timeout=10.0)
         if self._client is None:
             return
 
@@ -654,7 +654,7 @@ class CTraderMarketDataService:
             req = OAMsg.ProtoOAAccountAuthReq()
             req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
             req.accessToken = settings.CTRADER_ACCESS_TOKEN
-            d = self._client.send(req)
+            d = self._client.send(req, responseTimeoutInSeconds=10)
             ctx = self._build_deferred_context(
                 operation="account_auth_retry",
                 timeout_sec=5.0,
@@ -663,7 +663,7 @@ class CTraderMarketDataService:
             self._track_deferred(d, ctx)
 
     async def _request_symbols_list_retry(self, reason: str) -> None:
-        await self._ensure_client_ready(timeout=5.0)
+        await self._ensure_client_ready(timeout=10.0)
         if self._client is None:
             return
 
@@ -676,7 +676,7 @@ class CTraderMarketDataService:
             print(f"[MD] Reintentando SymbolsList ({reason})")
             req = OAMsg.ProtoOASymbolsListReq()
             req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
-            d = self._client.send(req)
+            d = self._client.send(req, responseTimeoutInSeconds=10)
             ctx = self._build_deferred_context(
                 operation="symbols_list_retry",
                 timeout_sec=5.0,
@@ -684,7 +684,7 @@ class CTraderMarketDataService:
             )
             self._track_deferred(d, ctx)
 
-    async def _ensure_client_ready(self, timeout: float = 5.0) -> None:
+    async def _ensure_client_ready(self, timeout: float = 10.0) -> None:
         self._async_loop = asyncio.get_running_loop()
         """
         Espera a que el cliente OpenAPI esté inicializado por el thread de Twisted.
@@ -761,7 +761,7 @@ class CTraderMarketDataService:
         req.symbolId.append(symbol_id)
         req.subscribeToSpotTimestamp = False
 
-        d = self._client.send(req)
+        d = self._client.send(req, responseTimeoutInSeconds=10)
         deferred_ctx = self._build_deferred_context(
             operation="subscribe_spots",
             symbol=symbol_u,
@@ -932,7 +932,7 @@ class CTraderMarketDataService:
                 RuntimeError(f"Error en ProtoOAReconcileReq: {failure!r}"),
             )
 
-        d = self._client.send(req)
+        d = self._client.send(req, responseTimeoutInSeconds=10)
         self._track_deferred(d, deferred_ctx)
         d.addCallback(_on_reconcile)
         d.addErrback(_on_error_deferred)
@@ -1156,7 +1156,7 @@ class CTraderMarketDataService:
         fut: asyncio.Future = loop.create_future()
         self._pending_orders[client_order_id] = fut
 
-        d = self._client.send(req)
+        d = self._client.send(req, responseTimeoutInSeconds=10)
         deferred_ctx = self._build_deferred_context(
             operation="new_market_order",
             symbol=symbol_u,
@@ -1326,7 +1326,7 @@ class CTraderMarketDataService:
             f"[MD] Enviando CLOSE position → positionId={position_id}, volume={req.volume}"
         )
 
-        d = self._client.send(req)
+        d = self._client.send(req, responseTimeoutInSeconds=10)
         deferred_ctx = self._build_deferred_context(
             operation="close_position",
             timeout_sec=5.0,
@@ -1440,7 +1440,7 @@ class CTraderMarketDataService:
         )
 
         send_ts = time.time()
-        d = self._client.send(req)
+        d = self._client.send(req, responseTimeoutInSeconds=10)
         ctx = self._build_deferred_context(
             operation="amend_position_sltp",
             symbol=symbol_u,

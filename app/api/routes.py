@@ -621,15 +621,22 @@ async def ws_prices(
             subscriptions.append((symbol, listener))
 
         while True:
-            prices = await hub.snapshot_many(symbols)
-            await websocket.send_json(
-                {
-                    "type": "prices",
-                    "count": len(symbols),
-                    "symbols": symbols,
-                    "prices": prices,
-                }
-            )
+            try:
+                prices = await hub.snapshot_many(symbols)
+                await websocket.send_json(
+                    {
+                        "type": "prices",
+                        "count": len(symbols),
+                        "symbols": symbols,
+                        "prices": prices,
+                    }
+                )
+            except Exception as exc:
+                # Error transitorio de snapshot/send: mantenemos el WS vivo y reintentamos.
+                try:
+                    await websocket.send_json({"type": "warn", "detail": f"transient_stream_error: {exc}"})
+                except Exception:
+                    pass
             await asyncio.sleep(interval)
     except WebSocketDisconnect:
         return
