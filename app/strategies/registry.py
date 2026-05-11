@@ -183,6 +183,7 @@ def _create_leg_continuation_runtime(
         leg_mode=str(params["leg_mode"]),
         retest_tolerance_points=float(params["retest_tolerance_points"]),
         rejection_wick_ratio=float(params["rejection_wick_ratio"]),
+        trigger_invalidation_points=float(params["trigger_invalidation_points"]),
     )
 
 
@@ -305,6 +306,7 @@ _REGISTRY: dict[str, StrategyDefinition] = {
             StrategyParamDef(key="leg_mode", type="string", required=True, default="extended"),
             StrategyParamDef(key="retest_tolerance_points", type="float", required=False, default=10.0),
             StrategyParamDef(key="rejection_wick_ratio", type="float", required=False, default=1.5),
+            StrategyParamDef(key="trigger_invalidation_points", type="float", required=False, default=200.0),
         ),
         normalize_params=_normalize_leg_continuation_params,
         create_runtime=_create_leg_continuation_runtime,

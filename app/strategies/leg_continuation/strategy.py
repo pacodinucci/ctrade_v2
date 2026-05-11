@@ -40,6 +40,7 @@ class LegContinuationH4M15Strategy:
         tp_points: int = 200,
         retest_tolerance_points: float = 10.0,
         rejection_wick_ratio: float = 1.5,
+        trigger_invalidation_points: float = 200.0,
     ) -> None:
         if int(pivot_strength) < 1:
             raise ValueError("pivot_strength debe ser >= 1")
@@ -55,10 +56,13 @@ class LegContinuationH4M15Strategy:
         self.tp_points = int(tp_points)
         self._retest_tolerance_points = float(retest_tolerance_points)
         self._rejection_wick_ratio = float(rejection_wick_ratio)
+        self._trigger_invalidation_points = float(trigger_invalidation_points)
         if self._retest_tolerance_points < 0:
             raise ValueError("retest_tolerance_points debe ser >= 0")
         if self._rejection_wick_ratio <= 0:
             raise ValueError("rejection_wick_ratio debe ser > 0")
+        if self._trigger_invalidation_points < 0:
+            raise ValueError("trigger_invalidation_points debe ser >= 0")
 
         self._h4: Deque[dict[str, Any]] = deque(maxlen=500)
         self._m15: Deque[dict[str, Any]] = deque(maxlen=1200)
@@ -117,6 +121,12 @@ class LegContinuationH4M15Strategy:
             if setup.breakout_close is None:
                 active.append(setup)
                 continue
+            if self._is_trigger_search_invalidated(
+                side=setup.side,
+                close_px=close_px,
+                continuation_level=setup.continuation_level,
+            ):
+                continue
 
             if not setup.entry_retest_done:
                 if self._did_retest_close_level(
@@ -125,7 +135,7 @@ class LegContinuationH4M15Strategy:
                     close_px=close_px,
                     high_px=high_px,
                     low_px=low_px,
-                    break_close=setup.breakout_close,
+                    break_close=setup.continuation_level,
                 ):
                     setup.entry_retest_done = True
                 active.append(setup)
@@ -308,6 +318,19 @@ class LegContinuationH4M15Strategy:
             return float(close_px) > float(level)
         return float(close_px) < float(level)
 
+    def _is_trigger_search_invalidated(
+        self,
+        *,
+        side: str,
+        close_px: float,
+        continuation_level: float,
+    ) -> bool:
+        invalidation_distance = self._trigger_invalidation_points * point_size(self.symbol)
+        side_u = str(side).strip().lower()
+        if side_u == "buy":
+            return float(close_px) < (float(continuation_level) - invalidation_distance)
+        return float(close_px) > (float(continuation_level) + invalidation_distance)
+
     @staticmethod
     def _candle_wicks(*, open_px: float, close_px: float, high_px: float, low_px: float) -> tuple[float, float, float]:
         body = abs(float(close_px) - float(open_px))
@@ -325,31 +348,13 @@ class LegContinuationH4M15Strategy:
         low_px: float,
         break_close: float,
     ) -> bool:
-        side_u = str(side).strip().lower()
         tol = self._retest_tolerance_points * point_size(self.symbol)
         zone_lo = float(break_close) - tol
         zone_hi = float(break_close) + tol
 
-        # Opcion 1: el rango de la vela visita la zona tolerada alrededor del nivel.
+        # Retest valido: el rango de la vela visita la zona tolerada alrededor del nivel.
         zone_touched = float(low_px) <= zone_hi and float(high_px) >= zone_lo
-        if zone_touched:
-            return True
-
-        # Opcion 2: vela de rechazo (cola larga) cerca de la zona, sin tocar exacto.
-        body, upper_wick, lower_wick = self._candle_wicks(
-            open_px=open_px,
-            close_px=close_px,
-            high_px=high_px,
-            low_px=low_px,
-        )
-        body_ref = max(body, point_size(self.symbol))
-
-        if side_u == "buy":
-            near_zone = float(low_px) <= zone_hi
-            return near_zone and (lower_wick / body_ref) >= self._rejection_wick_ratio
-
-        near_zone = float(high_px) >= zone_lo
-        return near_zone and (upper_wick / body_ref) >= self._rejection_wick_ratio
+        return zone_touched
 
     def build_trade_plan(self, side: str, entry: float) -> dict[str, float | str]:
         pt = point_size(self.symbol)
