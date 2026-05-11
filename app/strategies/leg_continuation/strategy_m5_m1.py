@@ -21,6 +21,7 @@ class PendingSetup:
     search_end: pd.Timestamp
     continuation_extended_at: pd.Timestamp | None = None
     breakout_confirmed_at: pd.Timestamp | None = None
+    breakout_confirmed_close: float | None = None
     entry_retest_done: bool = False
 
 
@@ -40,6 +41,7 @@ class LegContinuationM5M1Strategy:
         tp_points: int = 200,
         retest_tolerance_points: float = 10.0,
         rejection_wick_ratio: float = 1.5,
+        trigger_invalidation_points: float = 200.0,
         setup_stream_grace_seconds: int = 20,
     ) -> None:
         if int(pivot_strength) < 1:
@@ -56,10 +58,13 @@ class LegContinuationM5M1Strategy:
         self.tp_points = int(tp_points)
         self._retest_tolerance_points = float(retest_tolerance_points)
         self._rejection_wick_ratio = float(rejection_wick_ratio)
+        self._trigger_invalidation_points = float(trigger_invalidation_points)
         if self._retest_tolerance_points < 0:
             raise ValueError("retest_tolerance_points debe ser >= 0")
         if self._rejection_wick_ratio <= 0:
             raise ValueError("rejection_wick_ratio debe ser > 0")
+        if self._trigger_invalidation_points < 0:
+            raise ValueError("trigger_invalidation_points debe ser >= 0")
         if int(setup_stream_grace_seconds) < 0:
             raise ValueError("setup_stream_grace_seconds debe ser >= 0")
 
@@ -95,6 +100,7 @@ class LegContinuationM5M1Strategy:
                     breakout_level=setup.breakout_level,
                 ):
                     setup.breakout_confirmed_at = now
+                    setup.breakout_confirmed_close = close_px
                     setup.entry_retest_done = False
             active.append(setup)
         self._pending = active
@@ -124,6 +130,16 @@ class LegContinuationM5M1Strategy:
             if now <= setup.breakout_confirmed_at:
                 active.append(setup)
                 continue
+            if setup.breakout_confirmed_close is None:
+                active.append(setup)
+                continue
+            if self._is_trigger_search_invalidated(
+                side=setup.side,
+                close_px=close_px,
+                breakout_level=setup.breakout_level,
+            ):
+                self._mark_setup_invalidated("trigger_search_invalidated", now)
+                continue
 
             # Trigger en timeframe menor, habilitado solo tras breakout real en M5:
             # 2) esperar retest de ese nivel de cierre
@@ -144,7 +160,7 @@ class LegContinuationM5M1Strategy:
             if not self._is_breakout_real(
                 side=setup.side,
                 close_px=close_px,
-                breakout_level=setup.breakout_level,
+                breakout_level=setup.breakout_confirmed_close,
             ):
                 active.append(setup)
                 continue
@@ -206,6 +222,7 @@ class LegContinuationM5M1Strategy:
                     if first.breakout_confirmed_at is not None
                     else None
                 ),
+                "breakout_confirmed_close": first.breakout_confirmed_close,
                 "entry_retest_done": bool(first.entry_retest_done),
             }
         elif self._last_setup_invalidation_at is not None:
@@ -260,10 +277,12 @@ class LegContinuationM5M1Strategy:
 
         prev_continuation_extended_at: pd.Timestamp | None = None
         prev_breakout_confirmed_at: pd.Timestamp | None = None
+        prev_breakout_confirmed_close: float | None = None
         prev_entry_retest_done: bool = False
         if self._pending and self._pending[0].setup_id == setup_id:
             prev_continuation_extended_at = self._pending[0].continuation_extended_at
             prev_breakout_confirmed_at = self._pending[0].breakout_confirmed_at
+            prev_breakout_confirmed_close = self._pending[0].breakout_confirmed_close
             prev_entry_retest_done = bool(self._pending[0].entry_retest_done)
 
         continuation_extended_at = self._resolve_continuation_from_m5_history(
@@ -276,15 +295,18 @@ class LegContinuationM5M1Strategy:
         if continuation_extended_at is None:
             continuation_extended_at = prev_continuation_extended_at
 
-        breakout_confirmed_at = self._resolve_breakout_from_m5_history(
+        breakout_hit = self._resolve_breakout_from_m5_history(
             m5=m5,
             side=side,
             breakout_level=breakout_level,
             search_start=search_start,
             search_end=current_m5_time,
         )
-        if breakout_confirmed_at is None:
+        if breakout_hit is None:
             breakout_confirmed_at = prev_breakout_confirmed_at
+            breakout_confirmed_close = prev_breakout_confirmed_close
+        else:
+            breakout_confirmed_at, breakout_confirmed_close = breakout_hit
 
         self._pending = deque(
             [
@@ -296,6 +318,7 @@ class LegContinuationM5M1Strategy:
                     search_end=search_end,
                     continuation_extended_at=continuation_extended_at,
                     breakout_confirmed_at=breakout_confirmed_at,
+                    breakout_confirmed_close=breakout_confirmed_close,
                     entry_retest_done=(
                         prev_entry_retest_done
                         if breakout_confirmed_at is not None
@@ -350,7 +373,7 @@ class LegContinuationM5M1Strategy:
         breakout_level: float,
         search_start: pd.Timestamp,
         search_end: pd.Timestamp,
-    ) -> pd.Timestamp | None:
+    ) -> tuple[pd.Timestamp, float] | None:
         window = m5[
             (m5["time_utc"] > search_start)
             & (m5["time_utc"] <= search_end)
@@ -364,7 +387,7 @@ class LegContinuationM5M1Strategy:
                 close_px=float(row.close),
                 breakout_level=breakout_level,
             ):
-                return ensure_utc_timestamp(row.time_utc)
+                return ensure_utc_timestamp(row.time_utc), float(row.close)
         return None
 
     def _build_setup_id(
@@ -415,6 +438,19 @@ class LegContinuationM5M1Strategy:
             level=breakout_level,
         )
 
+    def _is_trigger_search_invalidated(
+        self,
+        *,
+        side: str,
+        close_px: float,
+        breakout_level: float,
+    ) -> bool:
+        invalidation_distance = self._trigger_invalidation_points * point_size(self.symbol)
+        side_u = str(side).strip().lower()
+        if side_u == "buy":
+            return float(close_px) < (float(breakout_level) - invalidation_distance)
+        return float(close_px) > (float(breakout_level) + invalidation_distance)
+
     @staticmethod
     def _candle_wicks(*, open_px: float, close_px: float, high_px: float, low_px: float) -> tuple[float, float, float]:
         body = abs(float(close_px) - float(open_px))
@@ -432,28 +468,10 @@ class LegContinuationM5M1Strategy:
         low_px: float,
         break_close: float,
     ) -> bool:
-        side_u = str(side).strip().lower()
         tol = self._retest_tolerance_points * point_size(self.symbol)
         zone_lo = float(break_close) - tol
         zone_hi = float(break_close) + tol
 
-        # Opcion 1: el rango de la vela visita la zona tolerada alrededor del nivel.
+        # Retest valido: el rango de la vela visita la zona tolerada alrededor del nivel.
         zone_touched = float(low_px) <= zone_hi and float(high_px) >= zone_lo
-        if zone_touched:
-            return True
-
-        # Opcion 2: vela de rechazo (cola larga) cerca de la zona, sin tocar exacto.
-        body, upper_wick, lower_wick = self._candle_wicks(
-            open_px=open_px,
-            close_px=close_px,
-            high_px=high_px,
-            low_px=low_px,
-        )
-        body_ref = max(body, point_size(self.symbol))
-
-        if side_u == "buy":
-            near_zone = float(low_px) <= zone_hi
-            return near_zone and (lower_wick / body_ref) >= self._rejection_wick_ratio
-
-        near_zone = float(high_px) >= zone_lo
-        return near_zone and (upper_wick / body_ref) >= self._rejection_wick_ratio
+        return zone_touched

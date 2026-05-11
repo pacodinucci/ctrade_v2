@@ -139,6 +139,7 @@ def _normalize_leg_continuation_params(strategy_params: dict[str, Any] | None) -
     leg_mode = str(params.get("leg_mode", "extended")).strip().lower()
     retest_tolerance_points = float(params.get("retest_tolerance_points", 10.0))
     rejection_wick_ratio = float(params.get("rejection_wick_ratio", 1.5))
+    trigger_invalidation_points = float(params.get("trigger_invalidation_points", 200.0))
 
     if volume < 100000:
         raise ValueError("volume debe ser >= 100000")
@@ -152,6 +153,8 @@ def _normalize_leg_continuation_params(strategy_params: dict[str, Any] | None) -
         raise ValueError("retest_tolerance_points debe ser >= 0")
     if rejection_wick_ratio <= 0:
         raise ValueError("rejection_wick_ratio debe ser > 0")
+    if trigger_invalidation_points < 0:
+        raise ValueError("trigger_invalidation_points debe ser >= 0")
 
     return {
         "volume": volume,
@@ -161,6 +164,7 @@ def _normalize_leg_continuation_params(strategy_params: dict[str, Any] | None) -
         "leg_mode": leg_mode,
         "retest_tolerance_points": retest_tolerance_points,
         "rejection_wick_ratio": rejection_wick_ratio,
+        "trigger_invalidation_points": trigger_invalidation_points,
     }
 
 
@@ -197,6 +201,7 @@ def _create_leg_continuation_m5_m1_runtime(
         leg_mode=str(params["leg_mode"]),
         retest_tolerance_points=float(params["retest_tolerance_points"]),
         rejection_wick_ratio=float(params["rejection_wick_ratio"]),
+        trigger_invalidation_points=float(params["trigger_invalidation_points"]),
     )
 
 
@@ -316,6 +321,7 @@ _REGISTRY: dict[str, StrategyDefinition] = {
             StrategyParamDef(key="leg_mode", type="string", required=True, default="extended"),
             StrategyParamDef(key="retest_tolerance_points", type="float", required=False, default=10.0),
             StrategyParamDef(key="rejection_wick_ratio", type="float", required=False, default=1.5),
+            StrategyParamDef(key="trigger_invalidation_points", type="float", required=False, default=200.0),
         ),
         normalize_params=_normalize_leg_continuation_params,
         create_runtime=_create_leg_continuation_m5_m1_runtime,
